@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .errors import PageIndexAPIError
-from .local_store import DocStore
+from .stores.base import DocumentStore
+from .stores.file import FileDocumentStore
 from .naming import sanitize_filename, truncate_filename
 from .utils import LLMRetriesExhausted, count_tokens, run_off_loop
 
@@ -43,8 +44,9 @@ class LocalAPI:
                  summary_concurrency: int | None = None,
                  use_embedded_toc: bool = True,
                  optimize: str = "full",
-                 summary_reasoning_effort: str | None = None):
-        self._store = DocStore(storage_path)
+                 summary_reasoning_effort: str | None = None,
+                 store: DocumentStore | None = None):
+        self._store = store if store is not None else FileDocumentStore(storage_path)
         self._model = model
         self._summary_model = summary_model
         self._index_backend = index_backend

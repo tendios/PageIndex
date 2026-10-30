@@ -12,7 +12,10 @@ other keys. The ``"pageindex-cloud"`` string is the label spelling for
 from __future__ import annotations
 
 import os
-from typing import Literal, TypedDict, Union
+from typing import TYPE_CHECKING, Any, Literal, Mapping, TypedDict, Union
+
+if TYPE_CHECKING:
+    from .stores.base import DocumentStore
 
 PAGEINDEX_CLOUD = "pageindex-cloud"
 
@@ -39,6 +42,7 @@ class LocalIndexConfig(TypedDict, total=False):
     optimize: Literal["full", "merge", "off"]
     backend: dict
     storage_path: Union[str, os.PathLike[str]]
+    store: Union["DocumentStore", Mapping[str, Any]]
 
 
 class ChatConfig(TypedDict, total=False):
