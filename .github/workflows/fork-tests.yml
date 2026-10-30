@@ -1,0 +1,29 @@
+name: Fork tests
+
+# tendios/PageIndex: the package tests on every push, with the store
+# extras (S3 on moto, SQL on SQLite). No model keys: nothing calls a model.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    if: github.repository == 'tendios/PageIndex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pytest "moto[s3]>=5.2" "boto3>=1.35.69" "sqlalchemy>=2.0"
+      - run: python -m pytest -q
