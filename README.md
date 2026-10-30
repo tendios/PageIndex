@@ -27,6 +27,36 @@
 
 
 
+## Fork tendios/PageIndex
+
+Este fork parte de [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) `v0.5.0` y se publica con etiquetas `v<upstream>-tendios.<n>` (versión del paquete `<upstream>+tendios.<n>`); fija una etiqueta, nunca `main`:
+
+```bash
+pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.1"
+```
+
+### Diferencias con upstream
+
+Solo en modo local; el modo cloud, el modo standard y el OCR no cambian.
+
+- **Almacenes** (`pageindex/stores/`): `PageIndexClient(index={"store": ...})` acepta `FileDocumentStore` (el de siempre, por defecto), `S3DocumentStore` (extra `[s3]`, compatible con MinIO) o `SqlDocumentStore` (extra `[sql]`), una instancia o `{"type": "file"|"s3"|"sql", ...}`. Mismo JSON y mismos ids en todos; `pageindex.stores.copy(origen, destino)` migra un índice. Ver [Storage backends](#storage-backends).
+- **`prefix` / `schema` en `SqlDocumentStore`**: `prefix="lib_a_"` antepone el prefijo a las tres tablas (documentos, `pageindex_library`, `pageindex_store_lock`) y `schema="lib_a"` (Postgres) las pone en ese esquema; con el mismo URL, cada prefijo o esquema es un almacén independiente con su propio cerrojo.
+- **`doc_id` externo**: `submit_document(..., doc_id="contrato-42")` indexa con ese id (1–128 caracteres `[A-Za-z0-9._-]`). Si ya existe, error 409.
+- **`if_exists="replace"`**: con `doc_id`, reindexa y sustituye el documento bajo el mismo id.
+- **Vista de biblioteca**: con `doc_id` como lista, el primer mensaje del chat lleva, por documento, nombre, metadatos, descripción y árbol (sin texto), recortado a niveles 1-2 por encima de `client.library_view_max_tokens` (12 000). La herramienta `get_library_structure(doc_names)` devuelve lo mismo en una llamada. `client.library_view = False` vuelve al comportamiento de upstream. Opcional: `client.build_library_topics()` construye un índice de temas con el modelo de indexado y `client.library_topics = True` lo muestra.
+
+### Rebasar sobre upstream
+
+```bash
+git remote add upstream https://github.com/VectifyAI/PageIndex.git
+git fetch upstream --tags
+git switch -c rebase/<versión> main
+git rebase upstream/main          # o la etiqueta, p. ej. v0.5.1
+python -m pytest -q               # tras resolver conflictos
+```
+
+Los commits del fork van por tema (almacenes, `doc_id`, vista de biblioteca, `prefix`, versión, CI, este README), así que cada conflicto queda en un tema. Después: pon la versión en `pyproject.toml` (`<upstream>+tendios.1`), lleva la rama a `main` (`git push --force-with-lease origin rebase/<versión>:main`) y etiqueta `v<upstream>-tendios.1`. `publish.yml` no publica desde el fork.
+
 <details open>
 <summary><h2>Updates</h2></summary>
 
