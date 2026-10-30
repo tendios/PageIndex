@@ -11,6 +11,7 @@ from typing import (TYPE_CHECKING, Any, Callable, Iterator, Literal, Mapping,
 
 from .chat_stream import ChatStream, MessagesStream, ChatObject
 from .errors import PageIndexAPIError
+from .stores.base import DocumentStore
 
 
 _litellm_preload_started = False
@@ -156,7 +157,7 @@ def _needs_model(surface: str) -> PageIndexAPIError:
 
 
 _LOCAL_INDEX_KEYS = ("model", "summary_model", "backend", "storage_path",
-                     "summary_max_words", "summary_concurrency",
+                     "store", "summary_max_words", "summary_concurrency",
                      "summary_reasoning_effort", "use_embedded_toc", "optimize")
 
 # Near-synonyms of "cloud" that would otherwise parse as model names —
@@ -185,7 +186,8 @@ _ARG_TYPES: "dict[str, tuple[type, ...]]" = {
     "chat_model": (str,), "retrieve_model": (str,), "summary_max_words": (int,),
     "summary_concurrency": (int,), "summary_reasoning_effort": (str,),
     "use_embedded_toc": (bool,), "optimize": (str,),
-    "storage_path": (str, os.PathLike), "index_backend": (dict,),
+    "storage_path": (str, os.PathLike), "store": (DocumentStore, Mapping),
+    "index_backend": (dict,),
     "chat_backend": (dict,)}
 
 
@@ -363,8 +365,11 @@ class PageIndexClient:
             dict: ``{"api_key": ...}`` for cloud, ``{"model",
             "summary_model", "backend", "storage_path",
             "summary_max_words", "summary_concurrency",
-            "summary_reasoning_effort", "use_embedded_toc", "optimize"}``
-            for local. An
+            "summary_reasoning_effort", "use_embedded_toc", "optimize",
+            "store"}`` for local — ``store`` is a ``pageindex.stores``
+            DocumentStore or a dict such as ``{"type": "s3", "bucket":
+            ...}`` / ``{"type": "sql", "url": ...}``, in place of
+            ``storage_path``. An
             optional ``"mode"`` key (``"cloud"`` / ``"local"``) states
             the side and must agree with the other keys; ``{"mode":
             "cloud"}`` alone reads the key from the environment. Not
@@ -696,10 +701,25 @@ class PageIndexClient:
                                            or overrides.get("model"))
                                       and not _yaml_names_chat(loader))
             self.chat_backend = chat_conf.get("chat_backend")
-            self.storage_path = index_conf.get("storage_path") or ".pageindex"
+            store = index_conf.get("store")
+            if store is not None:
+                if "storage_path" in index_conf:
+                    raise PageIndexAPIError(
+                        'index["store"] and storage_path both say where '
+                        "documents live — pass one of them (a file store "
+                        'is {"type": "file", "path": ...}).')
+                from .stores import open_store
+                try:
+                    store = open_store(store)
+                except (ImportError, TypeError, ValueError) as e:
+                    raise PageIndexAPIError(f'index["store"]: {e}') from e
+                self.storage_path = None
+            else:
+                self.storage_path = index_conf.get("storage_path") or ".pageindex"
             from .local_api import LocalAPI
             self._api = LocalAPI(
                 storage_path=self.storage_path,
+                store=store,
                 model=self.model,
                 summary_model=self.summary_model,
                 index_backend=index_conf.get("index_backend"),

@@ -52,15 +52,25 @@ claude-agent-sdk = { version = ">=0.2.166", optional = true }
 # Pre-0.122 lacks the Bedrock/Vertex tool runner; pre-0.108 executes a
 # refusal turn's tool_use blocks.
 anthropic = { version = ">=0.122.0", optional = true }
+# Document stores: S3DocumentStore needs conditional writes (If-None-Match /
+# If-Match on PutObject: 1.35.69); SqlDocumentStore is SQLAlchemy 2.0 Core.
+boto3 = { version = ">=1.35.69", optional = true }
+sqlalchemy = { version = ">=2.0", optional = true }
 
 [tool.poetry.extras]
 claude = ["claude-agent-sdk"]
 # Empty on purpose: keeps pip install "pageindex[openai]" valid.
 openai = []
 anthropic = ["anthropic"]
+s3 = ["boto3"]
+# Plus your database driver, e.g. psycopg for Postgres.
+sql = ["sqlalchemy"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"
+moto = { version = ">=5.2", extras = ["s3"] }
+boto3 = ">=1.35.69"
+sqlalchemy = ">=2.0"
 
 [tool.poetry.urls]
 Repository = "https://github.com/VectifyAI/PageIndex"
