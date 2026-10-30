@@ -19,6 +19,8 @@ from .utils import LLMRetriesExhausted, count_tokens, run_off_loop
 logger = logging.getLogger(__name__)
 
 _SURROGATES = re.compile("[\ud800-\udfff]")
+# A caller's doc_id is a path segment and an object key in every store.
+_DOC_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 
 def _scrub_surrogates(text: str) -> str:
@@ -80,6 +82,8 @@ class LocalAPI:
         beta_headers: list[str] | None = None,
         folder_id: str | None = None,
         metadata: dict | None = None,
+        doc_id: str | None = None,
+        if_exists: str | None = None,
     ) -> dict[str, Any]:
         if getattr(multiprocessing.current_process(), "_inheriting", False):
             raise PageIndexAPIError(
@@ -106,6 +110,23 @@ class LocalAPI:
                 raise PageIndexAPIError(
                     f"Failed to submit document: metadata must be valid JSON. {e}"
                 ) from e
+        if doc_id is not None and not (
+                isinstance(doc_id, str) and _DOC_ID.fullmatch(doc_id)
+                and doc_id not in (".", "..")):
+            raise PageIndexAPIError(
+                f"Failed to submit document: invalid doc_id {doc_id!r} — 1 to "
+                "128 letters, digits, '-', '_' or '.'.", status_code=400)
+        if if_exists not in (None, "error", "replace"):
+            raise PageIndexAPIError(
+                "Failed to submit document: if_exists must be \"error\" or "
+                f"\"replace\", got {if_exists!r}.", status_code=400)
+        if if_exists is not None and doc_id is None:
+            raise PageIndexAPIError(
+                "Failed to submit document: if_exists applies to a given "
+                "doc_id only.", status_code=400)
+        replace = if_exists == "replace"
+        if doc_id is not None and not replace:
+            self._check_doc_id_free(doc_id)  # before indexing; rechecked at save
         if mode not in (None, "standard", "flash"):
             raise PageIndexAPIError(
                 f"Failed to submit document: unknown local processing mode {mode!r}. "
@@ -141,7 +162,7 @@ class LocalAPI:
             raise PageIndexAPIError(
                 "Failed to submit document: PDF has no content. All pages are blank."
             )
-        self._unique_doc_name(doc_name)
+        self._unique_doc_name(doc_name, doc_id if replace else None)
 
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
                  "prompt_tokens_details": {"cached_tokens": 0,
@@ -167,16 +188,20 @@ class LocalAPI:
             raise PageIndexAPIError(f"Failed to submit document: {e}") from e
         self._check_page_bounds(structure, len(page_texts))
 
-        doc_id = "pi-" + uuid.uuid4().hex
+        if doc_id is None:
+            doc_id = "pi-" + uuid.uuid4().hex
         pages = [{"page_index": i + 1, "markdown": text}
                  for i, text in enumerate(page_texts)]
         from .utils import remove_fields
         # Check-then-write under the store lock; the early pre-check above
         # is advisory only.
         with self._store.lock():
+            if not replace:
+                self._check_doc_id_free(doc_id)
             meta = {
                 "id": doc_id,
-                "name": self._unique_doc_name(doc_name),
+                "name": self._unique_doc_name(
+                    doc_name, doc_id if replace else None),
                 "description": description,
                 "status": "completed",
                 "createdAt": _now_iso(),
@@ -189,10 +214,19 @@ class LocalAPI:
                 doc_id, meta, remove_fields(structure, fields=["text"]), pages)
         return {"doc_id": doc_id, "name": meta["name"], "usage": usage}
 
-    def _unique_doc_name(self, name: str) -> str:
+    def _check_doc_id_free(self, doc_id: str) -> None:
+        if self._store.get_meta(doc_id) is not None:
+            raise PageIndexAPIError(
+                f"Failed to submit document: doc_id {doc_id!r} already "
+                'exists — pass if_exists="replace" to reindex it.',
+                status_code=409)
+
+    def _unique_doc_name(self, name: str, replacing: str | None = None) -> str:
         """Mirror the cloud upload: a taken name gets _1.._99 appended,
-        beyond that the submit is rejected."""
-        taken = {meta.get("name") for meta in self._store.list_metas()}
+        beyond that the submit is rejected. The document being replaced
+        does not hold its own name."""
+        taken = {meta.get("name") for meta in self._store.list_metas()
+                 if replacing is None or meta.get("id") != replacing}
         if name not in taken:
             return name
         for num in range(1, 100):

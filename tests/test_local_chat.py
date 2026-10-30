@@ -1972,6 +1972,24 @@ def test_chat_returns_answer_string(client, store_path, fake_model):
 
 
 @needs_agents
+def test_chat_cites_a_caller_chosen_doc_id(client, store_path, fake_model):
+    """An id given at submit (submit_document(doc_id=...)) scopes chat and
+    comes back in the citations like a generated one."""
+    doc_id = seed_doc(store_path, "contract-2026_v2.1", "report.pdf")
+    fake = fake_model([
+        [_call_item("get_page_content",
+                    {"doc_name": "report.pdf", "pages": "1"})],
+        [_msg_item('Apples <cite doc="report.pdf" page="1"/>.')],
+    ])
+    answer = client.chat("What fruit?", doc_id=doc_id)
+    assert "The user has specified document: report.pdf" in (
+        fake.inputs[0][0]["content"])
+    assert "Page one text about apples" in json.dumps(fake.inputs[1])
+    assert client.get_citations(answer) == [
+        {"document": "report.pdf", "doc_id": "contract-2026_v2.1", "page": 1}]
+
+
+@needs_agents
 def test_chat_stream_yields_text_chunks(client, store_path, fake_model):
     fake_model([[_msg_item("The answer")]])
     assert list(client.chat("q", stream=True)) == ["The ", "answer"]
