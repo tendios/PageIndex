@@ -1972,6 +1972,31 @@ def test_chat_returns_answer_string(client, store_path, fake_model):
 
 
 @needs_agents
+def test_chat_on_a_doc_list_leads_with_the_library_view(client, store_path,
+                                                        fake_model):
+    """A doc_id list puts every outline in the first message, so the
+    agent reads pages at once; it carries get_library_structure() and the
+    guidance to use it, and library_view=False restores the old flow."""
+    seed_doc(store_path, "pi-a", "a.pdf")
+    seed_doc(store_path, "pi-b", "b.pdf")
+    fake = fake_model([
+        [_call_item("get_page_content", {"doc_name": "b.pdf", "pages": "1"})],
+        [_msg_item("done")],
+    ])
+    assert client.chat("q", doc_id=["pi-a", "pi-b"]) == "done"
+    first = fake.inputs[0][0]["content"]
+    assert "Document library" in first and "root summary" in first
+    assert "These outlines are complete" in first
+    assert "MULTI-DOCUMENT QUESTIONS:" in fake.instructions[0]
+
+    client.library_view = False
+    fake = fake_model([[_msg_item("done")]])
+    client.chat("q", doc_id=["pi-a", "pi-b"])
+    assert "Documents metadata: [" in fake.inputs[0][0]["content"]
+    assert "MULTI-DOCUMENT QUESTIONS:" not in fake.instructions[0]
+
+
+@needs_agents
 def test_chat_stream_yields_text_chunks(client, store_path, fake_model):
     fake_model([[_msg_item("The answer")]])
     assert list(client.chat("q", stream=True)) == ["The ", "answer"]
@@ -2842,7 +2867,8 @@ def test_responses_items_reads_messages_with_a_warning(client, store_path,
         with pytest.warns(DeprecationWarning):
             assert "items" in result
         assert "items" not in list(result)
-        assert '"items"' not in json.dumps(result)
+        # (a tool schema's array "items" is not the envelope key)
+        assert "items" not in json.loads(json.dumps(result))
 
 
 @needs_agents
@@ -3761,7 +3787,8 @@ def test_responses_envelope_fields_and_cache_group(client, store_path,
     result = client._responses("q")
     names = {tool["name"] for tool in result["tools"]}
     assert names == {"browse_documents", "get_document",
-                     "get_document_structure", "get_page_content"}
+                     "get_document_structure", "get_page_content",
+                     "get_library_structure"}
     assert all(tool["type"] == "function" for tool in result["tools"])
     assert result["instructions"].startswith(CHAT_HEADER)
     # No transport echo attached here, so these are the fallbacks.

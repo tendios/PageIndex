@@ -204,6 +204,36 @@ class LocalAPI:
             "Please use a different file name."
         )
 
+    def build_library_topics(self) -> dict[str, Any]:
+        from .library import build_topic_index, document_root
+        from .utils import llm_completion
+        metas = self._store.list_metas()
+        entries = [{"id": m.get("id"), "name": m.get("name"),
+                    "pageNum": m.get("pageNum"),
+                    "description": m.get("description"),
+                    "metadata": m.get("metadata")} for m in metas
+                   if m.get("status") == "completed"]
+        roots = [document_root(self, entry) for entry in entries]
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                 "prompt_tokens_details": {"cached_tokens": 0,
+                                           "cache_write_tokens": 0},
+                 "completion_tokens_details": {"reasoning_tokens": 0}}
+
+        def complete(prompt: str) -> str:
+            return run_off_loop(self._with_backend, usage, llm_completion,
+                                self._model, prompt)
+
+        try:
+            index = build_topic_index(
+                roots, complete, model=self._model,
+                created_at={m.get("id"): m.get("createdAt") for m in metas})
+        except LLMRetriesExhausted as e:
+            raise PageIndexAPIError(
+                f"Failed to build library topics: {e}") from e
+        self._store.save_library_index(index)
+        return {"topics": len(index["topics"]), "documents": len(roots),
+                "usage": usage}
+
     @staticmethod
     def _check_page_bounds(structure: list, page_count: int) -> None:
         """The tree (pdfium) and stored pages (PyPDF2) come from different

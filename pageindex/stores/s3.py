@@ -29,7 +29,8 @@ def _error_code(exc) -> str:
 
 class S3DocumentStore(DocumentStore):
     """One object per file, the file store's layout under ``prefix``:
-    ``<prefix>/docs/<doc_id>/{doc,tree,pages}.json`` — a ``.pageindex``
+    ``<prefix>/docs/<doc_id>/{doc,tree,pages}.json`` (and the library
+    index at ``<prefix>/library/topics.json``) — a ``.pageindex``
     directory synced to the bucket (``aws s3 sync``) reads as-is. No
     manifest: ``list_metas`` lists the prefix and reads every doc.json.
 
@@ -159,6 +160,13 @@ class S3DocumentStore(DocumentStore):
             except Exception as e:  # expired and taken over: not ours to drop
                 logger.warning("Could not release s3://%s/%s: %s",
                                self._bucket, key, e)
+
+    def get_library_index(self) -> dict | None:
+        index = self._get(self._key("library", "topics.json"))
+        return index if isinstance(index, dict) else None
+
+    def save_library_index(self, index: dict) -> None:
+        self._put(self._key("library", "topics.json"), index)
 
     # ── documents ──
     def save_document(self, doc_id: str, meta: dict, tree: list, pages: list) -> None:

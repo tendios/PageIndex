@@ -142,6 +142,17 @@ def test_client_lists_through_the_store(store):
     assert store.get_meta("pi-0") is None
 
 
+def test_library_index_round_trip(store):
+    assert store.get_library_index() is None
+    index = {"version": 1, "topics": {"t ✓": [{"doc_id": "pi-a",
+                                               "node_id": "0001"}]}}
+    store.save_library_index(index)
+    assert store.get_library_index() == index
+    store.save_library_index({"version": 1, "topics": {}})
+    assert store.get_library_index() == {"version": 1, "topics": {}}
+    assert store.list_metas() == []  # not a document
+
+
 # ── lock() ──
 
 def test_lock_excludes_other_holders(request, tmp_path):
@@ -228,6 +239,10 @@ def test_copy_round_trip(request, tmp_path):
     for name in ("doc.json", "tree.json", "pages.json"):
         assert (Path(tmp_path / "back/docs/pi-a" / name).read_bytes()
                 == Path(tmp_path / "file/store/docs/pi-a" / name).read_bytes())
+    assert back.get_library_index() is None
+    stores[0].save_library_index({"version": 1, "topics": {"t": []}})
+    copy(stores[0], stores[1])
+    assert stores[1].get_library_index() == {"version": 1, "topics": {"t": []}}
     assert copy(stores[0], back) == []  # already there
     assert sorted(copy(stores[0], back, overwrite=True)) == ["pi-a", "pi-b"]
 

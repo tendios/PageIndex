@@ -502,6 +502,15 @@ class PageIndexClient:
 
     _pin: Optional[str] = None  # the pinned subclasses' index side
 
+    #: Local mode: a ``chat(doc_id=[...])`` list leads with a library view —
+    #: every document's metadata and outline — and the agent gets
+    #: get_library_structure(). False restores the per-document flow.
+    library_view: bool = True
+    #: The view's token budget; past it, outlines keep levels 1-2 (then 1).
+    library_view_max_tokens: int = 12_000
+    #: Add the topic index built by build_library_topics() to the view.
+    library_topics: bool = False
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -2605,13 +2614,31 @@ class PageIndexClient:
         prefix stable.
 
         ``doc_id``: a document ID or list of IDs, as in ``chat``. Raises
-        PageIndexAPIError if a document does not exist.
+        PageIndexAPIError if a document does not exist. Local, a list
+        renders the library view (see ``library_view``).
         """
         from .agent_tools import doc_targeting_block
         if doc_id is None:
             raise PageIndexAPIError("doc_id must be a string or a list of "
                                     "strings.")
         return cast(str, doc_targeting_block(self, doc_id))
+
+    def build_library_topics(self) -> dict[str, Any]:
+        """
+        Local mode only: build the library's topic index — topic → the
+        sections covering it, across documents — with the index model,
+        from the node summaries, and store it beside the documents.
+        Chat adds it to the library view when ``library_topics`` is True.
+        Rebuild after adding documents; replaced or deleted ones drop out
+        on their own.
+
+        Returns {'topics': count, 'documents': count, 'usage': ...}.
+        """
+        if getattr(self, "api_key", None):
+            raise PageIndexAPIError(
+                "build_library_topics is local-only — the topic index is "
+                "built over the local store.")
+        return self._api.build_library_topics()
 
     def citation_prompt(self, format: str = "cite") -> str:
         """
