@@ -1,8 +1,13 @@
 """Document stores: one contract, three backends (disk, S3 via moto,
 SQLite via SQLAlchemy), plus copy() between them and the client's
-index={"store": ...} wiring. No network."""
+index={"store": ...} wiring. No network.
+
+PAGEINDEX_TEST_POSTGRES_URL (e.g. postgresql+psycopg://u:p@localhost/db)
+runs the contract on Postgres too, each test in a schema of its own."""
 import json
+import os
 import threading
+import uuid
 import warnings
 import time
 from pathlib import Path
@@ -60,7 +65,31 @@ def _sql_store(request, tmp_path):
     return SqlDocumentStore("sqlite://")
 
 
+POSTGRES_URL = os.environ.get("PAGEINDEX_TEST_POSTGRES_URL")
+
+
+def _postgres_store(request, tmp_path, **kwargs):
+    pytest.importorskip("sqlalchemy")
+    import sqlalchemy as sa
+    from pageindex.stores import SqlDocumentStore
+    schema = kwargs.pop("schema", None) or f"pi_test_{uuid.uuid4().hex[:12]}"
+    store = SqlDocumentStore(POSTGRES_URL, schema=schema, **kwargs)
+
+    def drop():
+        with store._engine.begin() as conn:
+            conn.execute(sa.schema.DropSchema(schema, cascade=True,
+                                              if_exists=True))
+        store._engine.dispose()
+
+    request.addfinalizer(drop)
+    return store
+
+
 FACTORIES = {"file": _file_store, "s3": _s3_store, "sql": _sql_store}
+if POSTGRES_URL:
+    FACTORIES["postgres"] = _postgres_store
+needs_postgres = pytest.mark.skipif(
+    not POSTGRES_URL, reason="PAGEINDEX_TEST_POSTGRES_URL is not set")
 
 
 @pytest.fixture(params=sorted(FACTORIES))
@@ -181,6 +210,82 @@ def test_lock_excludes_other_holders(request, tmp_path):
             order.append("first")
         thread.join(timeout=10)
         assert order == ["first", "second"], kind
+
+
+# ── one database, several stores (prefix / schema) ──
+
+def test_sql_prefixes_are_independent_stores(tmp_path):
+    pytest.importorskip("sqlalchemy")
+    import sqlalchemy as sa
+    from pageindex.stores import SqlDocumentStore
+    url = f"sqlite:///{tmp_path / 'shared.db'}"
+    a = SqlDocumentStore(url, prefix="lib_a_")
+    b = SqlDocumentStore(url, prefix="lib_b_")
+    plain = SqlDocumentStore(url)
+    a.save_document("pi-x", make_meta("pi-x", "a.pdf"), TREE, PAGES)
+    b.save_document("pi-x", make_meta("pi-x", "b.pdf"), TREE, PAGES)
+    a.save_library_index({"version": 1, "topics": {"a": []}})
+    assert a.get_meta("pi-x")["name"] == "a.pdf"
+    assert b.get_meta("pi-x")["name"] == "b.pdf"
+    assert plain.list_metas() == []
+    assert b.get_library_index() is None
+    assert b.delete_document("pi-x") and a.get_meta("pi-x")
+    tables = set(sa.inspect(a._engine).get_table_names())
+    for prefix in ("lib_a_", "lib_b_", ""):
+        assert {prefix + "pageindex_documents", prefix + "pageindex_library",
+                prefix + "pageindex_store_lock"} <= tables
+    store = open_store({"type": "sql", "url": url, "prefix": "lib_a_"})
+    assert store.get_meta("pi-x")["name"] == "a.pdf"
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    ({"prefix": "1bad"}, "Invalid prefix"),
+    ({"prefix": "a-b"}, "Invalid prefix"),
+    ({"prefix": "x" * 41}, "Invalid prefix"),
+    ({"schema": "a;b"}, "Invalid schema"),
+    ({"schema": "tenant"}, "SQLite has no schemas"),
+])
+def test_sql_prefix_and_schema_are_checked(kwargs, match):
+    pytest.importorskip("sqlalchemy")
+    from pageindex.stores import SqlDocumentStore
+    with pytest.raises(ValueError, match=match):
+        SqlDocumentStore("sqlite://", **kwargs)
+
+
+def _holds_lock_while(holder, other):
+    """Whether other.lock() is taken while holder.lock() is held."""
+    taken = threading.Event()
+
+    def contender():
+        with other.lock():
+            taken.set()
+
+    with holder.lock():
+        thread = threading.Thread(target=contender)
+        thread.start()
+        got_it = taken.wait(timeout=1)
+    thread.join(timeout=10)
+    return got_it
+
+
+@needs_postgres
+@pytest.mark.parametrize("isolation", ["prefix", "schema"])
+def test_postgres_isolated_stores_have_their_own_lock(request, tmp_path,
+                                                      isolation):
+    schema = f"pi_test_{uuid.uuid4().hex[:12]}"
+    if isolation == "prefix":
+        a = _postgres_store(request, tmp_path, schema=schema, prefix="a_")
+        b = _postgres_store(request, tmp_path, schema=schema, prefix="b_")
+        a_again = _postgres_store(request, tmp_path, schema=schema, prefix="a_")
+    else:
+        a = _postgres_store(request, tmp_path, schema=schema)
+        b = _postgres_store(request, tmp_path)
+        a_again = _postgres_store(request, tmp_path, schema=schema)
+    a.save_document("pi-x", make_meta("pi-x", "a.pdf"), TREE, PAGES)
+    assert b.list_metas() == []
+    assert a_again.get_meta("pi-x")["name"] == "a.pdf"
+    assert _holds_lock_while(a, b)            # another store: not blocked
+    assert not _holds_lock_while(a, a_again)  # the same store: waits
 
 
 def test_s3_lock_takes_over_a_stale_lease(s3_client):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from contextlib import contextmanager
 
@@ -22,6 +23,10 @@ def _dumps(data) -> str:
     return _scrub(json.dumps(data, ensure_ascii=False))
 
 
+# Leaves room for the longest table name within Postgres's 63 characters.
+_PREFIX = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
+
+
 class SqlDocumentStore(DocumentStore):
     """One row per document in ``pageindex_documents`` (doc_id, name,
     meta, tree, pages as JSON, created_at), created on first use; the
@@ -33,9 +38,14 @@ class SqlDocumentStore(DocumentStore):
     write lock every backend serializes on — and the store's own calls
     made inside it join that transaction, so the name check and the
     save commit together.
+
+    ``prefix`` (e.g. ``"tenant_a_"``) is put before all three table names
+    and ``schema`` (Postgres; created if missing) holds them: either way
+    one database keeps independent stores, each with its own lock.
     """
 
-    def __init__(self, url, *, table: str = "pageindex_documents"):
+    def __init__(self, url, *, table: str = "pageindex_documents",
+                 prefix: str = "", schema: str | None = None):
         if sa is None:
             raise ImportError(
                 "SqlDocumentStore needs SQLAlchemy — "
@@ -53,9 +63,20 @@ class SqlDocumentStore(DocumentStore):
                 options.update(poolclass=sa.pool.StaticPool,
                                connect_args={"check_same_thread": False})
             self._engine = sa.create_engine(url, **options)
-        metadata = sa.MetaData()
+        if prefix and not _PREFIX.fullmatch(prefix):
+            raise ValueError(
+                f"Invalid prefix {prefix!r}: up to 40 letters, digits or "
+                "underscores, not starting with a digit.")
+        if schema is not None:
+            if not _PREFIX.fullmatch(schema):
+                raise ValueError(f"Invalid schema {schema!r}.")
+            if self._engine.dialect.name == "sqlite":
+                raise ValueError("SQLite has no schemas: use prefix.")
+            with self._engine.begin() as conn:
+                conn.execute(sa.schema.CreateSchema(schema, if_not_exists=True))
+        metadata = sa.MetaData(schema=schema)
         self._docs = sa.Table(
-            table, metadata,
+            prefix + table, metadata,
             sa.Column("doc_id", sa.String(255), primary_key=True),
             sa.Column("name", sa.Text, nullable=False),
             sa.Column("meta", sa.JSON, nullable=False),
@@ -64,12 +85,12 @@ class SqlDocumentStore(DocumentStore):
             sa.Column("created_at", sa.String(64), nullable=False),
         )
         self._library = sa.Table(
-            "pageindex_library", metadata,
+            prefix + "pageindex_library", metadata,
             sa.Column("key", sa.String(64), primary_key=True),
             sa.Column("value", sa.JSON, nullable=False),
         )
         self._lock_row = sa.Table(
-            "pageindex_store_lock", metadata,
+            prefix + "pageindex_store_lock", metadata,
             sa.Column("id", sa.Integer, primary_key=True, autoincrement=False),
             sa.Column("generation", sa.Integer, nullable=False),
         )

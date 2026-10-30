@@ -120,8 +120,11 @@ client = PageIndexClient(index={"model": "gpt-6-luna", "store": {
 # Postgres (or SQLite): pip install -U "pageindex[sql]" psycopg
 client = PageIndexClient(index={"model": "gpt-6-luna", "store": {
     "type": "sql", "url": "postgresql+psycopg://user:pass@host/db",
+    "prefix": "",                       # e.g. "tenant_a_": one store per prefix
 }})
 ```
+
+In one database, `prefix=` (before all three table names: `pageindex_documents`, `pageindex_library`, `pageindex_store_lock`) or, on Postgres, `schema=` keeps independent stores, each with its own lock.
 
 Credentials come from the usual places (boto3's environment and profiles, the database URL). `store` also takes your own `pageindex.stores.DocumentStore` subclass. Every store keeps the same JSON under the same document ids, so `pageindex.stores.copy(source, target)` moves an index between them (see [example](https://github.com/VectifyAI/PageIndex/blob/main/cookbook/pageindex-storage-backends.py)).
 
