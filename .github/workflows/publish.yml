@@ -59,6 +59,8 @@ jobs:
 
   publish:
     needs: test
+    # Forks (tendios/PageIndex) tag releases too, but never publish.
+    if: github.repository == 'VectifyAI/PageIndex'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
