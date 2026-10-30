@@ -3,6 +3,7 @@ SQLite via SQLAlchemy), plus copy() between them and the client's
 index={"store": ...} wiring. No network."""
 import json
 import threading
+import warnings
 import time
 from pathlib import Path
 
@@ -306,3 +307,111 @@ def test_custom_store_subclass(tmp_path):
 def test_old_import_path_still_works():
     from pageindex.local_store import DocStore
     assert DocStore is FileDocumentStore
+
+
+# ── caller-chosen doc ids (local submit_document(doc_id=...)) ──
+
+STRUCTURE = [{"title": "Root", "node_id": "0000", "start_index": 1,
+              "end_index": 2, "summary": "root summary", "text": "root text"}]
+
+
+@pytest.fixture
+def indexing(monkeypatch):
+    """A stubbed standard pipeline; set indexing.title to change the tree."""
+    import importlib
+    classic = importlib.import_module("pageindex.page_index_classic")
+    state = {"title": "Root", "calls": 0}
+
+    def fake_page_index_main(doc, opt=None, logger=None, page_list=None):
+        state["calls"] += 1
+        structure = json.loads(json.dumps(STRUCTURE))
+        structure[0]["title"] = state["title"]
+        return {"doc_name": "sample.pdf", "doc_description": "d",
+                "structure": structure}
+    monkeypatch.setattr(classic, "page_index_main", fake_page_index_main)
+    return state
+
+
+def test_external_doc_id_is_used_everywhere(store, sample_pdf, indexing):
+    client = PageIndexClient(index={"store": store})
+    result = client.submit_document(sample_pdf, mode="standard",
+                                    doc_id="contract-2026_v2.1")
+    assert result["doc_id"] == "contract-2026_v2.1"
+    assert store.get_meta("contract-2026_v2.1")["id"] == "contract-2026_v2.1"
+    assert client.get_document("contract-2026_v2.1")["name"] == "sample.pdf"
+    assert client.get_tree("contract-2026_v2.1")["result"][0]["title"] == "Root"
+    assert "Hello page one" in client.get_page_content(
+        "contract-2026_v2.1", "1")[0]["markdown"]
+    assert client.get_citations('<cite doc="sample.pdf" page="1"/>') == [
+        {"document": "sample.pdf", "doc_id": "contract-2026_v2.1", "page": 1}]
+    client.delete_document("contract-2026_v2.1")
+    assert store.list_metas() == []
+
+
+@pytest.mark.parametrize("doc_id", [
+    "", "a" * 129, "a/b", "a\\b", "a b", "..", ".", "ñ", "x\n", 7])
+def test_invalid_external_doc_id(tmp_path, sample_pdf, indexing, doc_id):
+    client = PageIndexClient(storage_path=str(tmp_path / "s"))
+    with pytest.raises(PageIndexAPIError, match="invalid doc_id") as info:
+        client.submit_document(sample_pdf, mode="standard", doc_id=doc_id)
+    assert info.value.status_code == 400
+    assert indexing["calls"] == 0
+
+
+def test_taken_external_doc_id_is_refused_before_indexing(store, sample_pdf,
+                                                          indexing):
+    client = PageIndexClient(index={"store": store})
+    client.submit_document(sample_pdf, mode="standard", doc_id="doc-1")
+    with pytest.raises(PageIndexAPIError, match="already exists") as info:
+        client.submit_document(sample_pdf, mode="standard", doc_id="doc-1")
+    assert info.value.status_code == 409
+    assert indexing["calls"] == 1
+    with pytest.raises(PageIndexAPIError, match="already exists"):
+        client.submit_document(sample_pdf, mode="standard", doc_id="doc-1",
+                               if_exists="error")
+
+
+def test_if_exists_replace_leaves_nothing_of_the_old_document(
+        store, sample_pdf, indexing):
+    client = PageIndexClient(index={"store": store})
+    client.submit_document(sample_pdf, mode="standard", doc_id="doc-1",
+                           metadata={"version": 1})
+    indexing["title"] = "Replaced"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # its own name is free: no rename
+        result = client.submit_document(sample_pdf, mode="standard",
+                                        doc_id="doc-1", if_exists="replace")
+    assert result == {**result, "doc_id": "doc-1", "name": "sample.pdf"}
+    assert [m["id"] for m in store.list_metas()] == ["doc-1"]
+    assert store.get_meta("doc-1")["metadata"] is None
+    assert client.get_tree("doc-1")["result"][0]["title"] == "Replaced"
+    assert [p["page_index"] for p in store.get_pages("doc-1")] == [1, 2]
+    # replace also works for an id that is not there yet
+    client.submit_document(sample_pdf, mode="standard", doc_id="doc-2",
+                           if_exists="replace")
+    assert sorted(m["id"] for m in store.list_metas()) == ["doc-1", "doc-2"]
+
+
+def test_external_ids_keep_name_uniquing(tmp_path, sample_pdf, indexing):
+    client = PageIndexClient(storage_path=str(tmp_path / "s"))
+    client.submit_document(sample_pdf, mode="standard", doc_id="a")
+    with pytest.warns(UserWarning, match="sample_1.pdf"):
+        assert client.submit_document(sample_pdf, mode="standard",
+                                      doc_id="b")["name"] == "sample_1.pdf"
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    ({"if_exists": "replace"}, "doc_id only"),
+    ({"doc_id": "a", "if_exists": "merge"}, "if_exists must be"),
+])
+def test_if_exists_needs_a_doc_id_and_a_known_value(tmp_path, sample_pdf,
+                                                    indexing, kwargs, match):
+    client = PageIndexClient(storage_path=str(tmp_path / "s"))
+    with pytest.raises(PageIndexAPIError, match=match):
+        client.submit_document(sample_pdf, mode="standard", **kwargs)
+
+
+def test_cloud_refuses_external_doc_id(sample_pdf):
+    client = PageIndexClient(api_key="k")
+    with pytest.raises(PageIndexAPIError, match="doc_id is local-only"):
+        client.submit_document(sample_pdf, doc_id="a")
