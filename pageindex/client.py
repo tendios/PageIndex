@@ -11,6 +11,7 @@ from typing import (TYPE_CHECKING, Any, Callable, Iterator, Literal, Mapping,
 
 from .chat_stream import ChatStream, MessagesStream, ChatObject
 from .errors import PageIndexAPIError
+from .stores.base import DocumentStore
 
 
 _litellm_preload_started = False
@@ -156,7 +157,7 @@ def _needs_model(surface: str) -> PageIndexAPIError:
 
 
 _LOCAL_INDEX_KEYS = ("model", "summary_model", "backend", "storage_path",
-                     "summary_max_words", "summary_concurrency",
+                     "store", "summary_max_words", "summary_concurrency",
                      "summary_reasoning_effort", "use_embedded_toc", "optimize")
 
 # Near-synonyms of "cloud" that would otherwise parse as model names —
@@ -185,7 +186,8 @@ _ARG_TYPES: "dict[str, tuple[type, ...]]" = {
     "chat_model": (str,), "retrieve_model": (str,), "summary_max_words": (int,),
     "summary_concurrency": (int,), "summary_reasoning_effort": (str,),
     "use_embedded_toc": (bool,), "optimize": (str,),
-    "storage_path": (str, os.PathLike), "index_backend": (dict,),
+    "storage_path": (str, os.PathLike), "store": (DocumentStore, Mapping),
+    "index_backend": (dict,),
     "chat_backend": (dict,)}
 
 
@@ -363,8 +365,11 @@ class PageIndexClient:
             dict: ``{"api_key": ...}`` for cloud, ``{"model",
             "summary_model", "backend", "storage_path",
             "summary_max_words", "summary_concurrency",
-            "summary_reasoning_effort", "use_embedded_toc", "optimize"}``
-            for local. An
+            "summary_reasoning_effort", "use_embedded_toc", "optimize",
+            "store"}`` for local — ``store`` is a ``pageindex.stores``
+            DocumentStore or a dict such as ``{"type": "s3", "bucket":
+            ...}`` / ``{"type": "sql", "url": ...}``, in place of
+            ``storage_path``. An
             optional ``"mode"`` key (``"cloud"`` / ``"local"``) states
             the side and must agree with the other keys; ``{"mode":
             "cloud"}`` alone reads the key from the environment. Not
@@ -496,6 +501,15 @@ class PageIndexClient:
     BASE_URL = "https://api.pageindex.ai"
 
     _pin: Optional[str] = None  # the pinned subclasses' index side
+
+    #: Local mode: a ``chat(doc_id=[...])`` list leads with a library view —
+    #: every document's metadata and outline — and the agent gets
+    #: get_library_structure(). False restores the per-document flow.
+    library_view: bool = True
+    #: The view's token budget; past it, outlines keep levels 1-2 (then 1).
+    library_view_max_tokens: int = 12_000
+    #: Add the topic index built by build_library_topics() to the view.
+    library_topics: bool = False
 
     def __init__(
         self,
@@ -696,10 +710,25 @@ class PageIndexClient:
                                            or overrides.get("model"))
                                       and not _yaml_names_chat(loader))
             self.chat_backend = chat_conf.get("chat_backend")
-            self.storage_path = index_conf.get("storage_path") or ".pageindex"
+            store = index_conf.get("store")
+            if store is not None:
+                if "storage_path" in index_conf:
+                    raise PageIndexAPIError(
+                        'index["store"] and storage_path both say where '
+                        "documents live — pass one of them (a file store "
+                        'is {"type": "file", "path": ...}).')
+                from .stores import open_store
+                try:
+                    store = open_store(store)
+                except (ImportError, TypeError, ValueError) as e:
+                    raise PageIndexAPIError(f'index["store"]: {e}') from e
+                self.storage_path = None
+            else:
+                self.storage_path = index_conf.get("storage_path") or ".pageindex"
             from .local_api import LocalAPI
             self._api = LocalAPI(
                 storage_path=self.storage_path,
+                store=store,
                 model=self.model,
                 summary_model=self.summary_model,
                 index_backend=index_conf.get("index_backend"),
@@ -787,6 +816,8 @@ class PageIndexClient:
         folder_id: Optional[str] = None,
         metadata: Optional[dict] = None,
         wait: bool = False,
+        doc_id: Optional[str] = None,
+        if_exists: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Submit a PDF document for processing. Returns {'doc_id': ..., 'name': ...}.
@@ -821,6 +852,14 @@ class PageIndexClient:
                 after 30 minutes). Local: indexing is synchronous already, so
                 this changes nothing. Leave False to submit many documents
                 concurrently and poll afterwards.
+            doc_id (str, optional): Local-only — store the document under
+                your own id instead of a generated ``pi-<hex>``: 1 to 128
+                letters, digits, ``-``, ``_`` or ``.``. A taken id raises
+                PageIndexAPIError (status_code 409) before indexing starts.
+            if_exists (str, optional): Local-only, with ``doc_id`` —
+                ``"replace"`` reindexes and replaces the stored document
+                (tree, pages and metadata) under the same id; ``"error"``
+                (the default) refuses a taken id.
 
         Returns:
             dict: {'doc_id': ..., 'name': ...}. 'name' is the stored document
@@ -830,9 +869,17 @@ class PageIndexClient:
                 over every call, in the Chat Completions usage shape
                 LiteLLM returns.
         """
+        extra = {name: value for name, value in
+                 (("doc_id", doc_id), ("if_exists", if_exists))
+                 if value is not None}
+        if extra and getattr(self, "api_key", None):
+            raise PageIndexAPIError(
+                f"{' and '.join(extra)} {'is' if len(extra) == 1 else 'are'} "
+                "local-only — cloud documents get their id from PageIndex.")
         result = self._api.submit_document(
             file_path=file_path, mode=mode,
             beta_headers=beta_headers, folder_id=folder_id, metadata=metadata,
+            **extra,
         )
         stored = result.get("name")
         if stored and stored != os.path.basename(file_path):
@@ -2585,13 +2632,31 @@ class PageIndexClient:
         prefix stable.
 
         ``doc_id``: a document ID or list of IDs, as in ``chat``. Raises
-        PageIndexAPIError if a document does not exist.
+        PageIndexAPIError if a document does not exist. Local, a list
+        renders the library view (see ``library_view``).
         """
         from .agent_tools import doc_targeting_block
         if doc_id is None:
             raise PageIndexAPIError("doc_id must be a string or a list of "
                                     "strings.")
         return cast(str, doc_targeting_block(self, doc_id))
+
+    def build_library_topics(self) -> dict[str, Any]:
+        """
+        Local mode only: build the library's topic index — topic → the
+        sections covering it, across documents — with the index model,
+        from the node summaries, and store it beside the documents.
+        Chat adds it to the library view when ``library_topics`` is True.
+        Rebuild after adding documents; replaced or deleted ones drop out
+        on their own.
+
+        Returns {'topics': count, 'documents': count, 'usage': ...}.
+        """
+        if getattr(self, "api_key", None):
+            raise PageIndexAPIError(
+                "build_library_topics is local-only — the topic index is "
+                "built over the local store.")
+        return self._api.build_library_topics()
 
     def citation_prompt(self, format: str = "cite") -> str:
         """

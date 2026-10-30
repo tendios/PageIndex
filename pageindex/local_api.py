@@ -11,13 +11,16 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .errors import PageIndexAPIError
-from .local_store import DocStore
+from .stores.base import DocumentStore
+from .stores.file import FileDocumentStore
 from .naming import sanitize_filename, truncate_filename
 from .utils import LLMRetriesExhausted, count_tokens, run_off_loop
 
 logger = logging.getLogger(__name__)
 
 _SURROGATES = re.compile("[\ud800-\udfff]")
+# A caller's doc_id is a path segment and an object key in every store.
+_DOC_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 
 def _scrub_surrogates(text: str) -> str:
@@ -43,8 +46,9 @@ class LocalAPI:
                  summary_concurrency: int | None = None,
                  use_embedded_toc: bool = True,
                  optimize: str = "full",
-                 summary_reasoning_effort: str | None = None):
-        self._store = DocStore(storage_path)
+                 summary_reasoning_effort: str | None = None,
+                 store: DocumentStore | None = None):
+        self._store = store if store is not None else FileDocumentStore(storage_path)
         self._model = model
         self._summary_model = summary_model
         self._index_backend = index_backend
@@ -78,6 +82,8 @@ class LocalAPI:
         beta_headers: list[str] | None = None,
         folder_id: str | None = None,
         metadata: dict | None = None,
+        doc_id: str | None = None,
+        if_exists: str | None = None,
     ) -> dict[str, Any]:
         if getattr(multiprocessing.current_process(), "_inheriting", False):
             raise PageIndexAPIError(
@@ -104,6 +110,23 @@ class LocalAPI:
                 raise PageIndexAPIError(
                     f"Failed to submit document: metadata must be valid JSON. {e}"
                 ) from e
+        if doc_id is not None and not (
+                isinstance(doc_id, str) and _DOC_ID.fullmatch(doc_id)
+                and doc_id not in (".", "..")):
+            raise PageIndexAPIError(
+                f"Failed to submit document: invalid doc_id {doc_id!r} — 1 to "
+                "128 letters, digits, '-', '_' or '.'.", status_code=400)
+        if if_exists not in (None, "error", "replace"):
+            raise PageIndexAPIError(
+                "Failed to submit document: if_exists must be \"error\" or "
+                f"\"replace\", got {if_exists!r}.", status_code=400)
+        if if_exists is not None and doc_id is None:
+            raise PageIndexAPIError(
+                "Failed to submit document: if_exists applies to a given "
+                "doc_id only.", status_code=400)
+        replace = if_exists == "replace"
+        if doc_id is not None and not replace:
+            self._check_doc_id_free(doc_id)  # before indexing; rechecked at save
         if mode not in (None, "standard", "flash"):
             raise PageIndexAPIError(
                 f"Failed to submit document: unknown local processing mode {mode!r}. "
@@ -139,7 +162,7 @@ class LocalAPI:
             raise PageIndexAPIError(
                 "Failed to submit document: PDF has no content. All pages are blank."
             )
-        self._unique_doc_name(doc_name)
+        self._unique_doc_name(doc_name, doc_id if replace else None)
 
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
                  "prompt_tokens_details": {"cached_tokens": 0,
@@ -165,16 +188,20 @@ class LocalAPI:
             raise PageIndexAPIError(f"Failed to submit document: {e}") from e
         self._check_page_bounds(structure, len(page_texts))
 
-        doc_id = "pi-" + uuid.uuid4().hex
+        if doc_id is None:
+            doc_id = "pi-" + uuid.uuid4().hex
         pages = [{"page_index": i + 1, "markdown": text}
                  for i, text in enumerate(page_texts)]
         from .utils import remove_fields
         # Check-then-write under the store lock; the early pre-check above
         # is advisory only.
         with self._store.lock():
+            if not replace:
+                self._check_doc_id_free(doc_id)
             meta = {
                 "id": doc_id,
-                "name": self._unique_doc_name(doc_name),
+                "name": self._unique_doc_name(
+                    doc_name, doc_id if replace else None),
                 "description": description,
                 "status": "completed",
                 "createdAt": _now_iso(),
@@ -187,10 +214,19 @@ class LocalAPI:
                 doc_id, meta, remove_fields(structure, fields=["text"]), pages)
         return {"doc_id": doc_id, "name": meta["name"], "usage": usage}
 
-    def _unique_doc_name(self, name: str) -> str:
+    def _check_doc_id_free(self, doc_id: str) -> None:
+        if self._store.get_meta(doc_id) is not None:
+            raise PageIndexAPIError(
+                f"Failed to submit document: doc_id {doc_id!r} already "
+                'exists — pass if_exists="replace" to reindex it.',
+                status_code=409)
+
+    def _unique_doc_name(self, name: str, replacing: str | None = None) -> str:
         """Mirror the cloud upload: a taken name gets _1.._99 appended,
-        beyond that the submit is rejected."""
-        taken = {meta.get("name") for meta in self._store.list_metas()}
+        beyond that the submit is rejected. The document being replaced
+        does not hold its own name."""
+        taken = {meta.get("name") for meta in self._store.list_metas()
+                 if replacing is None or meta.get("id") != replacing}
         if name not in taken:
             return name
         for num in range(1, 100):
@@ -201,6 +237,36 @@ class LocalAPI:
             "Failed to submit document: Too many files with similar names. "
             "Please use a different file name."
         )
+
+    def build_library_topics(self) -> dict[str, Any]:
+        from .library import build_topic_index, document_root
+        from .utils import llm_completion
+        metas = self._store.list_metas()
+        entries = [{"id": m.get("id"), "name": m.get("name"),
+                    "pageNum": m.get("pageNum"),
+                    "description": m.get("description"),
+                    "metadata": m.get("metadata")} for m in metas
+                   if m.get("status") == "completed"]
+        roots = [document_root(self, entry) for entry in entries]
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                 "prompt_tokens_details": {"cached_tokens": 0,
+                                           "cache_write_tokens": 0},
+                 "completion_tokens_details": {"reasoning_tokens": 0}}
+
+        def complete(prompt: str) -> str:
+            return run_off_loop(self._with_backend, usage, llm_completion,
+                                self._model, prompt)
+
+        try:
+            index = build_topic_index(
+                roots, complete, model=self._model,
+                created_at={m.get("id"): m.get("createdAt") for m in metas})
+        except LLMRetriesExhausted as e:
+            raise PageIndexAPIError(
+                f"Failed to build library topics: {e}") from e
+        self._store.save_library_index(index)
+        return {"topics": len(index["topics"]), "documents": len(roots),
+                "usage": usage}
 
     @staticmethod
     def _check_page_bounds(structure: list, page_count: int) -> None:
