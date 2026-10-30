@@ -311,6 +311,53 @@ _READ_TOOLS = ("browse_documents", "get_document", "get_document_structure",
                "get_page_content")
 _MANAGEMENT_TOOLS = ("remove_document",)
 
+#: Local-only tools: not on the cloud MCP server, so outside TOOL_CONTRACT.
+LOCAL_TOOL_CONTRACT: dict[str, dict[str, Any]] = {
+    "get_library_structure": {
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "description": (
+            "Outlines of several documents in one call: for each document "
+            "its name, metadata, description and hierarchical outline "
+            "(section titles, page ranges, node summaries). When a question "
+            "spans several documents, call this once instead of "
+            "`get_document_structure()` per document — omit `doc_names` for "
+            "every document in scope — then pass the relevant page numbers "
+            "to `get_page_content()`. Use the `part` parameter to iterate "
+            "large libraries until `pagination.has_more` is false."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "doc_names": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "description": (
+                        "Document names, each copied verbatim from the "
+                        "`name` field of a browse_documents() response "
+                        "(case-sensitive, include extension). Omit for every "
+                        "document in scope."
+                    ),
+                },
+                "part": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991,
+                    "default": 1,
+                    "description": (
+                        "Part number for pagination (1-based, default 1). "
+                        "Increment until the response's `pagination.has_more` "
+                        "becomes false."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+}
+_LIBRARY_TOOLS = tuple(LOCAL_TOOL_CONTRACT)
+
 
 # ── response envelopes ──
 
@@ -1179,17 +1226,124 @@ def _remove_document(client, doc_names: list[str],
     )
 
 
+def _library_index(client) -> Optional[dict]:
+    """The stored topic index, when the client opted in (library_topics)."""
+    if not getattr(client, "library_topics", False):
+        return None
+    store = getattr(getattr(client, "_api", None), "_store", None)
+    return store.get_library_index() if store is not None else None
+
+
+def _get_library_structure(client, doc_names: Optional[list] = None,
+                           part: int = 1,
+                           _allowed_ids: Optional[frozenset] = None,
+                           ) -> tuple[dict, bool]:
+    from .library import document_root, topics_view
+    if getattr(client, "api_key", None):
+        return _failure(
+            "get_library_structure is local-only", None,
+            {"summary": "Not available on PageIndex cloud",
+             "options": ["Call get_document_structure() per document"]},
+            "INVALID_INPUT")
+    documents = _scope_documents(_all_documents(client, stop_ids=_allowed_ids),
+                                 _allowed_ids)
+    if doc_names is None:
+        entries = documents
+    else:
+        if (not isinstance(doc_names, list) or not doc_names
+                or not all(isinstance(name, str) and name.strip()
+                           for name in doc_names)):
+            return _failure(
+                "doc_names must be a non-empty array of document names", None,
+                {"summary": "Invalid document names",
+                 "options": ["Copy each name verbatim from a "
+                             "browse_documents() response, or omit doc_names "
+                             "for every document in scope"]},
+                "INVALID_INPUT")
+        entries, missing = [], []
+        for doc_name in dict.fromkeys(doc_names):
+            entry, error = _resolve_document(client, doc_name,
+                                             documents=documents,
+                                             allowed_ids=_allowed_ids)
+            if entry is None:
+                missing.append(doc_name)
+            else:
+                entries.append(entry)
+        if missing:
+            names = [str(doc.get("name")) for doc in documents]
+            return _failure(
+                "Documents not found: " + ", ".join(f'"{n}"' for n in missing),
+                {"doc_names": missing,
+                 "similar_files": sorted({match for name in missing
+                                          for match in difflib.get_close_matches(
+                                              name, names,
+                                              n=_SIMILAR_NAMES_LIMIT,
+                                              cutoff=0.5)})},
+                {"summary": "Some requested documents do not exist or are "
+                            "not accessible",
+                 "options": ["Use browse_documents() to see the exact names",
+                             "Omit doc_names for every document in scope"]},
+                "NOT_FOUND")
+
+    roots, unavailable = [], []
+    for entry in entries:
+        if entry.get("status") != "completed":
+            unavailable.append(entry.get("name"))
+            continue
+        try:
+            roots.append(document_root(client, entry))
+        except PageIndexAPIError:
+            unavailable.append(entry.get("name"))
+    chunks = _split_structure(roots, _CHAR_BUDGET)
+    total_parts = max(1, len(chunks))
+    try:
+        requested_part = int(part)
+    except (TypeError, ValueError):
+        requested_part = 1
+    current = min(max(requested_part, 1), total_parts)
+
+    data: dict[str, Any] = {"documents": chunks[current - 1]}
+    if current == 1:
+        topics = topics_view(_library_index(client), entries)
+        if topics:
+            data["topics"] = topics
+    if unavailable:
+        data["unavailable"] = unavailable
+    options = ["Use get_page_content() with a document name and the page "
+               "ranges above"]
+    if total_parts == 1:
+        return _success(data, {
+            "summary": f"Outlines of {len(roots)} document(s) retrieved.",
+            "options": options})
+    data["pagination"] = {"part": current, "total_parts": total_parts,
+                          "has_more": current < total_parts}
+    return _success(data, {
+        "summary": f"Showing part {current} of {total_parts}.",
+        "options": ([f"Request next part with part: {current + 1}"]
+                    if current < total_parts else []) + options})
+
+
 _IMPLEMENTATIONS: dict[str, Callable[..., tuple[dict, bool]]] = {
     "browse_documents": _browse_documents,
     "get_document": _get_document,
     "get_document_structure": _get_document_structure,
     "get_page_content": _get_page_content,
+    "get_library_structure": _get_library_structure,
     "remove_document": _remove_document,
 }
 
 
-def tool_names(include_management: bool = False) -> tuple[str, ...]:
-    return _READ_TOOLS + (_MANAGEMENT_TOOLS if include_management else ())
+def tool_names(include_management: bool = False,
+               library: bool = True) -> tuple[str, ...]:
+    """The local tool set; ``library`` adds get_library_structure (a
+    client's ``library_view``)."""
+    return (_READ_TOOLS + (_LIBRARY_TOOLS if library else ())
+            + (_MANAGEMENT_TOOLS if include_management else ()))
+
+
+def _library_enabled(client) -> bool:
+    return (not getattr(client, "api_key", None)
+            and bool(getattr(client, "library_view", True)))
 
 
 def _coerce_bool_args(schema: dict, kwargs: dict[str, Any]) -> None:
@@ -1234,7 +1388,7 @@ def call_tool(client, name: str, arguments: dict[str, Any],
     # "omit if ..." semantics, same as the cloud bridge invoker).
     kwargs = {key: value for key, value in (arguments or {}).items()
               if not key.startswith("_") and value is not None}
-    _coerce_bool_args(TOOL_CONTRACT.get(name, {}).get("schema", {}), kwargs)
+    _coerce_bool_args(_contract(name)["schema"], kwargs)
     try:
         if doc_ids is not None:
             ids = [doc_ids] if isinstance(doc_ids, str) else doc_ids
@@ -1315,12 +1469,16 @@ _LOCAL_PARAM_DESCRIPTIONS: dict[tuple[str, str], str] = {
 }
 
 
+def _contract(name: str) -> dict[str, Any]:
+    return TOOL_CONTRACT.get(name) or LOCAL_TOOL_CONTRACT[name]
+
+
 def _local_description(name: str) -> str:
-    return _LOCAL_DESCRIPTIONS.get(name) or TOOL_CONTRACT[name]["description"]
+    return _LOCAL_DESCRIPTIONS.get(name) or _contract(name)["description"]
 
 
 def _local_schema(name: str) -> dict[str, Any]:
-    schema = copy.deepcopy(TOOL_CONTRACT[name]["schema"])
+    schema = copy.deepcopy(_contract(name)["schema"])
     for param in _LOCAL_HIDDEN_PARAMS.get(name, ()):
         schema["properties"].pop(param, None)
     for (tool_name, param), text in _LOCAL_PARAM_DESCRIPTIONS.items():
@@ -1559,13 +1717,14 @@ def _tool_specs(client, include_management: bool = False, doc_ids=None,
             return [{"type": "text", "text": text}], is_error
         return invoke
 
+    names = tool_names(include_management, library=_library_enabled(client))
     if annotations is not None:
-        annotations.update({name: TOOL_CONTRACT[name]["annotations"]
-                            for name in tool_names(include_management)
-                            if TOOL_CONTRACT[name].get("annotations")})
+        annotations.update({name: _contract(name)["annotations"]
+                            for name in names
+                            if _contract(name).get("annotations")})
     return [(name, _local_description(name), _local_schema(name),
              local_invoke(name))
-            for name in tool_names(include_management)]
+            for name in names]
 
 
 def build_agent_tools(client, include_management: bool = False,
@@ -1621,14 +1780,16 @@ Applies both when results are empty AND when returned results do not clearly mat
 3. Page through the ENTIRE library with `limit: 50` and `offset: next_offset` until has_more is false — MANDATORY, must be completed before concluding "not found"
 Only after ALL steps have been tried may you conclude the document is not in the library. Do NOT fall back to general knowledge — if the user's question references their own documents, exhaust every discovery path first."""
 
-AGENT_INSTRUCTIONS = "\n\n".join([
-    _INSTRUCTIONS_HEADER,
-    _DISCOVERY,
-    _DECISION,
-    _AFTER_DISCOVERY,
-    _PERSISTENCE,
-    _TOOL_USAGE_RULES,
-])
+_LIBRARY = """\
+MULTI-DOCUMENT QUESTIONS:
+- When a question spans several documents, get their outlines with ONE get_library_structure() call (doc_names, or no argument for every document in scope), never one get_document_structure() call per document.
+- When the conversation already carries a complete document library view, do not fetch outlines again: pick the sections there and go straight to get_page_content(). Fetch outlines only for documents the view marks as abridged, and only when the kept levels do not locate the answer."""
+
+_SECTIONS = [_INSTRUCTIONS_HEADER, _DISCOVERY, _DECISION, _AFTER_DISCOVERY,
+             _PERSISTENCE, _TOOL_USAGE_RULES]
+AGENT_INSTRUCTIONS = "\n\n".join(_SECTIONS[:4] + [_LIBRARY] + _SECTIONS[4:])
+# library_view=False: the tool set and guidance before the library view.
+_AGENT_INSTRUCTIONS_NO_LIBRARY = "\n\n".join(_SECTIONS)
 
 
 # Frozen from the cloud MCP server's ``cited_answer`` prompt, minus the
@@ -1682,7 +1843,8 @@ def _base_instructions(client, include_management: bool = False) -> str:
     """Cloud: the live instructions the MCP server serves for the tool set
     actually shipped. Local: the built-in subset instructions."""
     if not getattr(client, "api_key", None):
-        base = AGENT_INSTRUCTIONS
+        base = (AGENT_INSTRUCTIONS if _library_enabled(client)
+                else _AGENT_INSTRUCTIONS_NO_LIBRARY)
     else:
         base = _cloud_bridge(
             client, gated=not include_management).instructions()
@@ -1723,6 +1885,8 @@ def doc_targeting_block(client, doc_id) -> Optional[str]:
     if missing:
         raise PageIndexAPIError(
             "Documents not found or access denied: " + ", ".join(missing))
+    if isinstance(doc_id, list) and _library_enabled(client):
+        return _library_targeting_block(client, details)
     if len(details) == 1:
         return (
             f"The user has specified document: {details[0].get('name')}\n"
@@ -1737,6 +1901,46 @@ def doc_targeting_block(client, doc_id) -> Optional[str]:
         "Use these documents' names to retrieve their content with "
         "get_document_structure() and get_page_content()."
     )
+
+
+def _library_targeting_block(client, details: list) -> str:
+    """Local doc_id lists: the library view — every document's metadata
+    and outline under one root each, abridged to fit
+    ``client.library_view_max_tokens`` — so the agent starts reading
+    pages without a structure call per document."""
+    from .library import (LIBRARY_VIEW_MAX_TOKENS, document_root, fit_view,
+                          topics_view)
+    from .utils import count_tokens
+    budget = getattr(client, "library_view_max_tokens", LIBRARY_VIEW_MAX_TOKENS)
+    roots = [document_root(client, entry) for entry in details]
+    view, levels = fit_view(roots, budget, count_tokens)
+    names = ", ".join(str(item.get("name")) for item in details)
+    parts = [
+        f"The user has specified documents: {names}",
+        "Document library — one root per document (name, metadata, "
+        "description, and its outline: section titles, page ranges, node "
+        "summaries):",
+        json.dumps(view, ensure_ascii=False),
+    ]
+    topics = topics_view(_library_index(client), details)
+    if topics:
+        rendered = json.dumps(topics, ensure_ascii=False)
+        if count_tokens(rendered) <= budget // 4:
+            parts += ["Library topic index (topic → sections):", rendered]
+    if levels is None:
+        parts.append(
+            "These outlines are complete: pick the sections here and read "
+            "them with get_page_content(); get_document_structure() and "
+            "get_library_structure() would only repeat them.")
+    else:
+        kept = {2: "levels 1-2", 1: "level 1"}.get(levels, "no outline")
+        parts.append(
+            f"Outlines abridged to {kept} to fit {budget} tokens "
+            "(nodes_omitted counts hidden subsections). Read pages with "
+            "get_page_content() where the kept levels locate the answer; "
+            "otherwise call get_library_structure() once for the documents "
+            "you need in full.")
+    return "\n".join(parts)
 
 
 def folder_targeting_block(client, folder_id) -> Optional[str]:

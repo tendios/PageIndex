@@ -75,4 +75,8 @@ def copy(source: StoreSpec, target: StoreSpec, *,
             continue
         target.save_document(doc_id, meta, tree, pages)
         copied.append(doc_id)
+    # The library index names documents by id, so it stays valid as-is.
+    index = source.get_library_index()
+    if index is not None and (overwrite or target.get_library_index() is None):
+        target.save_library_index(index)
     return copied
