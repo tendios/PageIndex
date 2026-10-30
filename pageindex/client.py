@@ -870,6 +870,8 @@ class PageIndexClient:
         metadata: Optional[dict] = None,
         wait: bool = False,
         collection_id: Optional[str] = None,
+        doc_id: Optional[str] = None,
+        if_exists: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Submit a PDF document for processing. Returns {'doc_id': ..., 'name': ...}.
@@ -912,6 +914,14 @@ class PageIndexClient:
             collection_id (str, optional): Cloud-only collection to store the
                 document in, in place of a folder: passing ``folder_id`` too
                 raises PageIndexAPIError (HTTP 400).
+            doc_id (str, optional): Local-only — store the document under
+                your own id instead of a generated ``pi-<hex>``: 1 to 128
+                letters, digits, ``-``, ``_`` or ``.``. A taken id raises
+                PageIndexAPIError (status_code 409) before indexing starts.
+            if_exists (str, optional): Local-only, with ``doc_id`` —
+                ``"replace"`` reindexes and replaces the stored document
+                (tree, pages and metadata) under the same id; ``"error"``
+                (the default) refuses a taken id.
 
         Returns:
             dict: {'doc_id': ..., 'name': ...}. 'name' is the stored document
@@ -921,10 +931,18 @@ class PageIndexClient:
                 over every call, in the Chat Completions usage shape
                 LiteLLM returns.
         """
+        extra = {name: value for name, value in
+                 (("doc_id", doc_id), ("if_exists", if_exists))
+                 if value is not None}
+        if extra and getattr(self, "api_key", None):
+            raise PageIndexAPIError(
+                f"{' and '.join(extra)} {'is' if len(extra) == 1 else 'are'} "
+                "local-only — cloud documents get their id from PageIndex.")
         result = self._api.submit_document(
             file_path=file_path, mode=mode,
             beta_headers=beta_headers, folder_id=folder_id, metadata=metadata,
             collection_id=collection_id,
+            **extra,
         )
         stored = result.get("name")
         if stored and stored != os.path.basename(file_path):
