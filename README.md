@@ -104,6 +104,25 @@ print(answer)
 
 **Have a Claude subscription?** PageIndex can use your subscription to call Claude models through Claude Code: usage is covered by your plan, no API key needed. Install with `pip install -U "pageindex[claude]"`, then prefix model names with `claude-code/`, e.g., `index="claude-code/haiku"`, `chat="claude-code/opus"` (see [example](https://github.com/VectifyAI/PageIndex/blob/main/cookbook/pageindex-claude-subscription.py)).
 
+### Storage backends
+
+Local mode stores each document as three JSON files under `./.pageindex` (change it with `storage_path=`). To keep them in S3 or a database instead, pass a `store` in `index=`:
+
+```python
+# S3 or any S3-compatible service (MinIO, R2): pip install -U "pageindex[s3]"
+client = PageIndexClient(index={"model": "gpt-6-luna", "store": {
+    "type": "s3", "bucket": "my-bucket", "prefix": "pageindex",
+    "endpoint_url": None,               # e.g. "http://localhost:9000" for MinIO
+}})
+
+# Postgres (or SQLite): pip install -U "pageindex[sql]" psycopg
+client = PageIndexClient(index={"model": "gpt-6-luna", "store": {
+    "type": "sql", "url": "postgresql+psycopg://user:pass@host/db",
+}})
+```
+
+Credentials come from the usual places (boto3's environment and profiles, the database URL). `store` also takes your own `pageindex.stores.DocumentStore` subclass. Every store keeps the same JSON under the same document ids, so `pageindex.stores.copy(source, target)` moves an index between them (see [example](https://github.com/VectifyAI/PageIndex/blob/main/cookbook/pageindex-storage-backends.py)).
+
 ### [Use PageIndex through the SDK client →](https://docs.pageindex.ai/getting-started)
 
 Configure other models, streaming, multi-document search, citations, and more.
