@@ -50,6 +50,15 @@ class FileDocumentStore(DocumentStore):
         self._root = Path(storage_dir).expanduser()
         self._docs = self._root / "docs"
         self._manifest = self._root / "manifest.json"
+        self._library = self._root / "library" / "topics.json"
+
+    def get_library_index(self) -> dict | None:
+        index = _read_json(self._library)
+        return index if isinstance(index, dict) else None
+
+    def save_library_index(self, index: dict) -> None:
+        self._library.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(self._library, index)
 
     def _doc_dir(self, doc_id: str) -> Path | None:
         if not _is_safe_id(doc_id):
