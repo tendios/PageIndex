@@ -24,7 +24,8 @@ def _dumps(data) -> str:
 
 class SqlDocumentStore(DocumentStore):
     """One row per document in ``pageindex_documents`` (doc_id, name,
-    meta, tree, pages as JSON, created_at), created on first use.
+    meta, tree, pages as JSON, created_at), created on first use; the
+    library index is a row of ``pageindex_library``.
 
     ``url`` is a SQLAlchemy URL (``postgresql+psycopg://…``,
     ``sqlite:///index.db``) or an Engine. ``lock()`` is a transaction
@@ -61,6 +62,11 @@ class SqlDocumentStore(DocumentStore):
             sa.Column("tree", sa.JSON, nullable=False),
             sa.Column("pages", sa.JSON, nullable=False),
             sa.Column("created_at", sa.String(64), nullable=False),
+        )
+        self._library = sa.Table(
+            "pageindex_library", metadata,
+            sa.Column("key", sa.String(64), primary_key=True),
+            sa.Column("value", sa.JSON, nullable=False),
         )
         self._lock_row = sa.Table(
             "pageindex_store_lock", metadata,
@@ -101,6 +107,20 @@ class SqlDocumentStore(DocumentStore):
                 yield
             finally:
                 self._held.conn = None
+
+    def get_library_index(self) -> dict | None:
+        with self._conn() as conn:
+            index = conn.execute(sa.select(self._library.c.value).where(
+                self._library.c.key == "topics")).scalar_one_or_none()
+        return index if isinstance(index, dict) else None
+
+    def save_library_index(self, index: dict) -> None:
+        library = self._library
+        with self._conn() as conn:
+            if not conn.execute(library.update()
+                                .where(library.c.key == "topics")
+                                .values(value=index)).rowcount:
+                conn.execute(library.insert().values(key="topics", value=index))
 
     # ── documents ──
     def save_document(self, doc_id: str, meta: dict, tree: list, pages: list) -> None:

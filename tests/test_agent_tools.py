@@ -2683,6 +2683,17 @@ _LOCAL_ONLY_LINES = (
     "not in the library. Do NOT fall back to general knowledge — if the "
     "user's question references their own documents, exhaust every discovery "
     "path first.",
+    # get_library_structure() is a local-only tool.
+    "MULTI-DOCUMENT QUESTIONS:",
+    "- When a question spans several documents, get their outlines with ONE "
+    "get_library_structure() call (doc_names, or no argument for every "
+    "document in scope), never one get_document_structure() call per "
+    "document.",
+    "- When the conversation already carries a complete document library "
+    "view, do not fetch outlines again: pick the sections there and go "
+    "straight to get_page_content(). Fetch outlines only for documents the "
+    "view marks as abridged, and only when the kept levels do not locate the "
+    "answer.",
 )
 
 
@@ -3164,10 +3175,13 @@ def test_doc_targeting_keeps_transport_errors_out_of_not_found():
 
 
 def test_doc_targeting_is_one_lookup_per_document():
-    """One get_document per id, rendered like the cloud's managed chat."""
+    """One get_document per id, rendered like the cloud's managed chat
+    (local lists render the library view unless it is off)."""
     calls = []
 
     class Client:
+        library_view = False
+
         def get_document(self, doc_id):
             calls.append(doc_id)
             return {"id": doc_id, "name": f"{doc_id}.pdf",

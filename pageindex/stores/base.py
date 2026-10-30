@@ -80,3 +80,14 @@ class DocumentStore(ABC):
         lists names, picks a free one and saves under it). It only guards
         those sequences against other writers of the same store; plain
         reads and writes never need it."""
+
+    # Optional: the library topic index (PageIndexClient.build_library_topics).
+    # A store without it simply has none.
+    def get_library_index(self) -> dict | None:
+        """The stored library index, or None."""
+        return None
+
+    def save_library_index(self, index: dict) -> None:
+        """Store (replace) the library index."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not store a library index.")
