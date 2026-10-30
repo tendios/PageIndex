@@ -97,6 +97,8 @@ answer = client.chat("What was the 2023 operating margin?", doc_id=doc_id)
 print(answer)
 ```
 
+Local documents get a generated `pi-…` id; pass `doc_id=` to use your own (1–128 letters, digits, `-`, `_`, `.`), e.g. `client.submit_document("report.pdf", doc_id="report-2023")`. A taken id is refused (`PageIndexAPIError`, `status_code` 409) unless you pass `if_exists="replace"`, which reindexes the file and replaces the stored document under the same id.
+
 ### Model Recommendations
 
 - **`index=`: a basic model is sufficient.** The tree structure itself is extracted from the document layout without an LLM; the index model only summarizes and refines it, which a basic model does well.
