@@ -158,7 +158,8 @@ def _needs_model(surface: str) -> PageIndexAPIError:
 
 _LOCAL_INDEX_KEYS = ("model", "summary_model", "backend", "storage_path",
                      "store", "summary_max_words", "summary_concurrency",
-                     "summary_reasoning_effort", "use_embedded_toc", "optimize", "pdf_parser")
+                     "summary_reasoning_effort", "use_embedded_toc", "optimize", "pdf_parser",
+                     "heading_judge")
 
 # Near-synonyms of "cloud" that would otherwise parse as model names —
 # a silent wrong mode. They error, pointing at the real word.
@@ -186,6 +187,7 @@ _ARG_TYPES: "dict[str, tuple[type, ...]]" = {
     "chat_model": (str,), "retrieve_model": (str,), "summary_max_words": (int,),
     "summary_concurrency": (int,), "summary_reasoning_effort": (str,),
     "use_embedded_toc": (bool,), "optimize": (str,), "pdf_parser": (str, Mapping),
+    "heading_judge": (str, Mapping),
     "storage_path": (str, os.PathLike), "store": (DocumentStore, Mapping),
     "index_backend": (dict,),
     "chat_backend": (dict,)}
@@ -366,7 +368,7 @@ class PageIndexClient:
             "summary_model", "backend", "storage_path",
             "summary_max_words", "summary_concurrency",
             "summary_reasoning_effort", "use_embedded_toc", "optimize", "pdf_parser",
-            "store"}`` for local — ``store`` is a ``pageindex.stores``
+            "heading_judge", "store"}`` for local — ``store`` is a ``pageindex.stores``
             DocumentStore or a dict such as ``{"type": "s3", "bucket":
             ...}`` / ``{"type": "sql", "url": ...}``, in place of
             ``storage_path``. An
@@ -465,6 +467,11 @@ class PageIndexClient:
         optimize (str, optional): Local mode only — the flash tree
             refinement pass: ``"full"`` (merge + model expand, the
             default), ``"merge"`` (deterministic merge only) or ``"off"``.
+        heading_judge (str | dict, optional): Local mode only — who decides,
+            in ``mode="headings"``, the lines no rule settles: ``"typesafe"``
+            (Jev, key from ``TYPESAFE_AI_API_KEY`` or ``{"name": "typesafe",
+            "api_key": ..., "model": ..., "base_url": ...}``) or ``"none"``
+            (the rules alone). Defaults to none.
         pdf_parser (str | dict, optional): Local PDF reader: ``"default"``
             preserves the existing readers; ``"liteparse"`` enables optional
             OCR and layout. A dict accepts name="liteparse", ocr_mode
@@ -533,6 +540,7 @@ class PageIndexClient:
         use_embedded_toc: Optional[bool] = None,
         optimize: Optional[str] = None,
         pdf_parser: Optional[Union[str, Mapping[str, Any]]] = None,
+        heading_judge: Optional[Union[str, Mapping[str, Any]]] = None,
         retrieve_model: Optional[str] = None,
         storage_path: Optional[Union[str, os.PathLike[str]]] = None,
         index_backend: Optional[dict[str, Any]] = None,
@@ -564,6 +572,7 @@ class PageIndexClient:
              ("use_embedded_toc", use_embedded_toc),
              ("optimize", optimize),
              ("pdf_parser", pdf_parser),
+             ("heading_judge", heading_judge),
              ("index_backend", index_backend),
              ("storage_path", storage_path), ("model", model))
             if value is not None}
@@ -651,6 +660,11 @@ class PageIndexClient:
                 if name == "optimize" and value not in ("full", "merge", "off"):
                     raise PageIndexAPIError(
                         f'{shown} must be "full", "merge" or "off", got {value!r}.')
+                if name == "heading_judge":
+                    judge_name = value if isinstance(value, str) else value.get("name")
+                    if (judge_name or "").strip().lower() not in ("typesafe", "none"):
+                        raise PageIndexAPIError(
+                            f'{shown} must be "typesafe", "none" or a dict with name="typesafe", got {value!r}.')
                 if name == "pdf_parser":
                     from .pdf_extraction import parser_config
                     try:
@@ -751,6 +765,7 @@ class PageIndexClient:
                 optimize=index_conf.get("optimize", "full"),
                 summary_reasoning_effort=index_conf.get("summary_reasoning_effort"),
                 pdf_parser=index_conf.get("pdf_parser"),
+                heading_judge=index_conf.get("heading_judge"),
             )
             # LiteLLM's multi-second import would otherwise land on the
             # first chat call; failures resurface there with real context.
@@ -3082,6 +3097,7 @@ class PageIndexLocalClient(PageIndexClient):
         use_embedded_toc: Optional[bool] = None,
         optimize: Optional[str] = None,
         pdf_parser: Optional[Union[str, Mapping[str, Any]]] = None,
+        heading_judge: Optional[Union[str, Mapping[str, Any]]] = None,
         retrieve_model: Optional[str] = None,
         storage_path: Optional[Union[str, os.PathLike[str]]] = None,
         index_backend: Optional[dict[str, Any]] = None,

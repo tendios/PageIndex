@@ -48,7 +48,8 @@ class LocalAPI:
                  optimize: str = "full",
                  summary_reasoning_effort: str | None = None,
                  store: DocumentStore | None = None,
-                 pdf_parser: str | dict | None = None):
+                 pdf_parser: str | dict | None = None,
+                 heading_judge: str | dict | None = None):
         self._store = store if store is not None else FileDocumentStore(storage_path)
         self._model = model
         self._summary_model = summary_model
@@ -60,6 +61,8 @@ class LocalAPI:
         self._optimize = optimize
         from .pdf_extraction import parser_config
         self._pdf_parser = parser_config(pdf_parser)
+        # mode="headings": who decides the lines no rule settles; None or "none" leaves them to the rules.
+        self._heading_judge = heading_judge
         from .utils import ConfigLoader
         self._config_loader = ConfigLoader()
 
@@ -130,10 +133,10 @@ class LocalAPI:
         replace = if_exists == "replace"
         if doc_id is not None and not replace:
             self._check_doc_id_free(doc_id)  # before indexing; rechecked at save
-        if mode not in (None, "standard", "flash"):
+        if mode not in (None, "standard", "flash", "headings"):
             raise PageIndexAPIError(
                 f"Failed to submit document: unknown local processing mode {mode!r}. "
-                "Supported: 'flash' (default) or 'standard'."
+                "Supported: 'flash' (default), 'standard' or 'headings'."
             )
         if mode is None:
             mode = "flash"
@@ -182,6 +185,11 @@ class LocalAPI:
                 structure, description = run_off_loop(
                     self._with_backend, usage, self._index_flash, file_path,
                     *([extraction] if extraction is not None else [])
+                )
+            elif mode == "headings":
+                structure, description = run_off_loop(
+                    self._with_backend, usage, self._index_headings, file_path,
+                    extraction, page_texts, doc_name
                 )
             else:
                 structure, description = run_off_loop(
@@ -365,6 +373,77 @@ class LocalAPI:
             create_clean_structure_for_description(structure, top_level_only=True),
             model=self._summary_model,
         )
+        return structure, description
+
+    def _heading_judge_instance(self):
+        """The judge of mode="headings": Typesafe's Jev with the configured key (or TYPESAFE_AI_API_KEY), or
+        none, which leaves the undecided lines to the rules."""
+        conf = self._heading_judge
+        if conf is None or conf == "none" or conf == "":
+            return None
+        if isinstance(conf, str):
+            conf = {"name": conf}
+        name = (conf.get("name") or "").strip().lower()
+        if name != "typesafe":
+            raise PageIndexAPIError(
+                f"Failed to submit document: unknown heading_judge {name!r}; use \"typesafe\" or \"none\".")
+        api_key = conf.get("api_key") or os.environ.get("TYPESAFE_AI_API_KEY", "")
+        if not api_key:
+            raise PageIndexAPIError(
+                "Failed to submit document: heading_judge \"typesafe\" needs an api_key, or TYPESAFE_AI_API_KEY "
+                "in the environment.")
+        from .headings import TYPESAFE_MODEL, TYPESAFE_URL, TypesafeHeadingJudge
+        return TypesafeHeadingJudge(api_key=api_key, model=conf.get("model") or TYPESAFE_MODEL,
+                                    base_url=conf.get("base_url") or TYPESAFE_URL,
+                                    timeout=float(conf.get("timeout") or 90), workers=int(conf.get("workers") or 4))
+
+    def _index_headings(self, file_path: str, extraction, page_texts: list[str],
+                        doc_name: str) -> tuple[list, str | None]:
+        """The tree from the document's own headings (see ``pageindex.headings``), then the flash summaries and
+        description. Needs LiteParse: the headings are its blocks."""
+        import asyncio
+        from .flash.api import _page_nodes, _summarize
+        from .headings import build_headings_structure
+        from .utils import (SUMMARY_MAX_WORDS, create_clean_structure_for_description,
+                            default_summary_reasoning_effort, generate_doc_description,
+                            learn_model_if_effort_dropped, write_node_id)
+        if extraction is None:
+            raise PageIndexAPIError(
+                "Failed to submit document: mode='headings' reads the headings LiteParse finds; configure "
+                "pdf_parser='liteparse'.")
+        layout_structure = None
+        try:
+            # The layout titles flash detects, without its model passes: the same entry tests and callers stub.
+            from .flash import page_index_flash
+            detected = page_index_flash(file_path, summary=False, optimize=False,
+                                        use_embedded_toc=self._use_embedded_toc)
+            if detected.get("toc_source") not in ("pages", "unreadable"):
+                layout_structure = detected.get("structure")
+        except Exception as exc:  # scanned or odd PDFs: the headings alone decide
+            logger.info("headings: layout detection unavailable (%s)", exc)
+        structure, report = build_headings_structure(
+            extraction.pages, page_texts, layout_structure, judge=self._heading_judge_instance(),
+            document={"name": doc_name, "pages": len(page_texts)})
+        backend = "headings"
+        if not structure:
+            structure, backend = _page_nodes(page_texts), "headings_pages"
+        extraction.metadata["structure_backend"] = backend
+        extraction.metadata["headings"] = {key: value for key, value in report.items() if key != "decisions"}
+        write_node_id(structure)
+        summary_model = self._summary_model or self._model
+        from .integrations.claude_agent_sdk import is_claude_code
+        if not is_claude_code(summary_model):
+            learn_model_if_effort_dropped(summary_model)
+        effort = (self._summary_reasoning_effort or "").strip() or None
+        defaulted = effort is None
+        if defaulted:
+            effort = default_summary_reasoning_effort(summary_model)
+        asyncio.run(_summarize(structure, [(text, 0) for text in page_texts], summary_model,
+                               concurrency=self._summary_concurrency,
+                               max_words=self._summary_max_words or SUMMARY_MAX_WORDS,
+                               reasoning_effort=effort, drop_refused_effort=defaulted))
+        description = generate_doc_description(
+            create_clean_structure_for_description(structure, top_level_only=True), model=summary_model)
         return structure, description
 
     # ── tree / ocr ──
