@@ -32,7 +32,7 @@
 Este fork parte de [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) `v0.5.0` y se publica con etiquetas `v<upstream>-tendios.<n>` (versión del paquete `<upstream>+tendios.<n>`); fija una etiqueta, nunca `main`:
 
 ```bash
-pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.5"
+pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.6"
 ```
 
 ### Diferencias con upstream
@@ -52,7 +52,7 @@ Las extensiones de indexado se activan en modo local; el modo cloud conserva su 
 Instalación de la versión del fork con LiteParse:
 
 ```bash
-pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.5"
+pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.6"
 ```
 
 Para desarrollar desde este checkout:
