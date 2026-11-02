@@ -117,7 +117,8 @@ conclusión ni garantiza que el OCR reconozca correctamente la imagen.
 | `status` | `complete`, `partial` o `failed` |
 | `answer` | Respuesta global con referencias `[E000001]`; vacío si no pudo sintetizarse o cambió una fuente |
 | `answer_parts` | Respuestas por lote, con `finding_ids`; no tratarlas como comparación global cuando el estado es parcial |
-| `citations` | Hallazgos literales: `id`, `doc_id`, `name`, `page`, `quote`, `note`, `source_id`, `fingerprint`, `locations`, `geometry_status`, `match`, `validation` |
+| `citations` | Hallazgos literales: `id`, `doc_id`, `name`, `page`, `quote`, `note`, `source_id`, `fingerprint`, `locations`, `geometry_status`, `match` (`exact_normalized`: la cita del modelo tal cual; `snapped`: el modelo solo cambió el formato y `quote` es el texto propio del pasaje), `validation`; `relocated_from` cuando el modelo atribuyó la cita a otro pasaje del mismo lote |
+| `findings_dropped` | Hallazgos descartados sin interrumpir la ejecución: `source_id`, `doc_id`, `page`, `reason` (`invalid_quote`: la cita cambia letras o cifras respecto a su pasaje; `invalid_reference`: nombra un pasaje no leído y ningún pasaje del lote, o más de uno, la contiene; `invalid_response`: no es un objeto) y `quote` tal como la devolvió el modelo, sin verificar |
 | `documents` | Huella/estado por documento, partes estructurales totales/examinadas/pendientes, páginas seleccionadas/leídas/pendientes, `extraction_pending` y `all_pages_read` |
 | `reasons`, `pending_stage` | Causa y etapa no completada |
 | `usage`, `usage_complete` | Suma de tokens informados y si todos los intentos informaron consumo |
@@ -129,7 +130,10 @@ conclusión ni garantiza que el OCR reconozca correctamente la imagen.
 la respuesta final. Para mostrar solo los citados, `pageindex.multidoc.cited_ids(answer)`
 devuelve los ids citados en orden (tolera anotaciones dentro del corchete, como
 `[E000001, pág. 6]`); cruzarlos con `citations[].id`. `note` es interpretación del
-modelo. `quote` es texto literal.
+modelo. `quote` es texto literal: si el modelo quitó las barras de una tabla, cambió
+mayúsculas, tildes, guiones o comillas, `quote` lleva los caracteres del pasaje y
+`match` vale `snapped`; si cambió una letra o una cifra, el hallazgo va a
+`findings_dropped` y la ejecución sigue con el resto del lote.
 No pasar directamente el nuevo `answer` a `client.get_citations()`: su formato de
 referencias es distinto del `<cite>` del chat habitual.
 
@@ -150,7 +154,7 @@ modelo que devolvió respuesta. Incluye respuestas cortadas o inválidas;
 `extraction_pending` indica qué pasajes no completaron la extracción validada.
 
 Causas actuales: `max_calls`, `max_total_tokens`, `timeout`, `input_budget`,
-`incomplete_answer`, `invalid_response`, `invalid_reference`, `invalid_quote`,
+`incomplete_answer`, `invalid_response`, `invalid_reference`,
 `model_error`, `source_error`, `source_unavailable`, `source_changed`,
 `document_not_ready`, `synthesis_partitioned`. No convertirlas en respuestas
 que afirmen ausencia de información.
