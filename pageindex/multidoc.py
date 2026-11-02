@@ -55,8 +55,10 @@ needed to combine documents. Return {"findings": [{"source_id": "passage id",
 "quote": "verbatim text from that passage", "note": "why it matters"}]}.
 Prefer concise quotations (up to 800 characters each) and notes under 240
 characters; use multiple findings rather than one oversized quotation.
-Do not paraphrase inside quote; whitespace differences are allowed. Return an
-empty findings array if none. Notes are interpretations, not additional facts.""",
+Copy quote character for character from the passage, including table bars,
+punctuation, accents and figures; do not paraphrase, fix or reformat it.
+Whitespace differences are allowed. Return an empty findings array if none.
+Notes are interpretations, not additional facts.""",
     "synthesis": """Answer the question using the literal findings below. Reassess the
 notes against their quotations. Preserve contradictions and exceptions. Cite
 every factual claim with its finding id in square brackets, e.g. [E000001].
@@ -117,6 +119,74 @@ def _digest(value: Any) -> str:
 
 def _normal(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).split())
+
+
+_NUMBER_SEPARATORS = ".,"
+_TABLE_RULE = re.compile(r"^:?-{3,}:?$")
+
+
+def _skeleton(text: str) -> tuple[str, list[int]]:
+    """Letters and digits, casefolded and stripped of accents, one space for
+    any run of other characters, each mapped back to the index of the original
+    character it came from. A ``.`` or ``,`` between two digits stays: number
+    separators are content, not formatting. ``<br>`` is the stored tables' own
+    line break, not text."""
+    chars, origins, index, gap = [], [], 0, False
+    while index < len(text):
+        if text.startswith("<br>", index):
+            gap, index = True, index + 4
+            continue
+        char = text[index]
+        if (char in _NUMBER_SEPARATORS and 0 < index < len(text) - 1
+                and text[index - 1].isdigit() and text[index + 1].isdigit()):
+            pieces = [char]
+        else:
+            pieces = [folded for piece in unicodedata.normalize("NFKD", char)
+                      if unicodedata.category(piece) != "Mn" and piece.isalnum()
+                      for folded in piece.casefold()]
+        if not pieces:
+            gap = True
+        else:
+            if gap and chars:
+                chars.append(" ")
+                origins.append(index)
+            gap = False
+            chars.extend(pieces)
+            origins.extend([index] * len(pieces))
+        index += 1
+    return "".join(chars), origins
+
+
+def _fit(quote: Any, text: str) -> Optional[tuple[str, str]]:
+    """The stored text a model quote stands for, and how it matched.
+
+    ``("exact_normalized", quote)`` when the quote is a substring of the
+    passage after NFKC and whitespace normalization. ``("snapped", passage
+    characters)`` when only formatting differs (table bars, punctuation, case,
+    accents, dashes, quote marks) and letters, digits and number separators
+    agree in order: the citation then carries the passage's own text. ``None``
+    otherwise: a changed word or figure never fits, and is dropped, not cited.
+    """
+    if not isinstance(quote, str) or not _normal(quote):
+        return None
+    if _normal(quote) in _normal(text):
+        return quote, "exact_normalized"
+    wanted, _ = _skeleton(quote)
+    have, origins = _skeleton(text)
+    at = have.find(wanted) if wanted else -1
+    if at < 0:
+        return None
+    return text[origins[at]:origins[at + len(wanted) - 1] + 1], "snapped"
+
+
+def _plain(quote: str) -> str:
+    """A stored markdown table row as its words read on the page: no bars,
+    rule cells or ``<br>``, escaped bars restored. Geometry matches the page's
+    word stream, which never carries table syntax."""
+    cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", quote)]
+    kept = [cell.replace("\\|", "|").replace("<br>", " ") for cell in cells
+            if cell and not _TABLE_RULE.match(cell)]
+    return " ".join(" ".join(kept).split())
 
 
 _BRACKETS = re.compile(r"\[([^\[\]]*)\]")
@@ -299,7 +369,7 @@ class _Run:
         self.usage = dict.fromkeys(_USAGE, 0)
         self.usage_known, self.charged = True, 0
         self.stage, self.answer = "snapshot", ""
-        self.reasons, self.stale = [], []
+        self.reasons, self.stale, self.dropped = [], [], []
 
     def responses(self, phase, batches):
         """Output truncation is recoverable by smaller batches, not by repeating
@@ -508,35 +578,63 @@ class _Run:
         seen = set()
         for batch, data in self.responses("extract", self.passages()):
             findings = data.get("findings")
-            allowed = {r["source_id"] for r in batch}
             if not isinstance(findings, list):
                 raise _Stop("invalid_response", "Extraction response needs a findings array")
-            checked = []
+            by_id = {r["source_id"]: r for r in batch}
+            checked, dropped = [], 0
             for item in findings:
-                if not isinstance(item, dict) or item.get("source_id") not in allowed:
-                    raise _Stop("invalid_reference", "Finding names an unread passage")
-                source = self.sources[item["source_id"]]
-                quote, note = item.get("quote"), item.get("note")
-                if not isinstance(quote, str) or not _normal(quote) or _normal(quote) not in _normal(source["text"]):
-                    raise _Stop("invalid_quote", "Finding is not a literal quotation of its source")
-                if not isinstance(note, str):
-                    raise _Stop("invalid_response", "Finding note must be text")
-                checked.append((source, quote, note))
-            for source, quote, note in checked:
+                placed = self.place(item, by_id)
+                if placed is None:
+                    dropped += 1
+                    continue
+                checked.append(placed)
+            if dropped:
+                self.calls[-1]["findings_dropped"] = dropped
+            for source, quote, match, note, named in checked:
                 key = (source["doc_id"], source["page"], _normal(quote))
                 if key in seen:
                     continue
                 seen.add(key)
-                self.findings.append({"id": f"E{len(self.findings) + 1:06d}", "doc_id": source["doc_id"],
-                                      "page": source["page"], "source_id": source["source_id"],
-                                      "quote": quote, "note": note})
+                finding = {"id": f"E{len(self.findings) + 1:06d}", "doc_id": source["doc_id"],
+                           "page": source["page"], "source_id": source["source_id"],
+                           "quote": quote, "note": note, "match": match}
+                if named != source["source_id"]:
+                    finding["relocated_from"] = named
+                self.findings.append(finding)
             for source in batch:
                 self.extracted_seen.add(source["source_id"])
+
+    def place(self, item, by_id):
+        """A finding's passage, literal quote and match, or None once recorded
+        in findings_dropped: that finding alone is lost, never its batch or the
+        run. The named passage is tried first; a quote the model attributed to
+        the wrong passage of the same batch is relocated when exactly one holds
+        it. A quote no passage holds, or two do, is dropped."""
+        item = item if isinstance(item, dict) else {}
+        named, quote, note = item.get("source_id"), item.get("quote"), item.get("note")
+        source = by_id.get(named)
+        fit = _fit(quote, source["text"]) if source is not None else None
+        if fit is None:
+            holders = [(s, f) for s in by_id.values() if s is not source
+                       for f in [_fit(quote, s["text"])] if f is not None]
+            if len(holders) == 1:
+                (source, fit), = holders
+        if fit is None:
+            reason = ("invalid_response" if not item else
+                      "invalid_quote" if source is not None else "invalid_reference")
+            self.dropped.append({"source_id": named if isinstance(named, str) else None,
+                                 "doc_id": source["doc_id"] if source is not None else None,
+                                 "page": source["page"] if source is not None else None,
+                                 "reason": reason, "quote": quote[:1000] if isinstance(quote, str) else None})
+            return None
+        text, match = fit
+        return source, text, match, note if isinstance(note, str) else "", named
 
     def synthesize(self):
         # No lossy recursive summarization: if all findings cannot fit, return
         # explicit per-batch answers and mark the global synthesis incomplete.
-        records = [{**f, "name": self.snapshots[f["doc_id"]]["document"].get("name")} for f in self.findings]
+        records = [{**{k: v for k, v in f.items() if k not in ("match", "relocated_from")},
+                    "name": self.snapshots[f["doc_id"]]["document"].get("name")} for f in self.findings]
         batches = self.pack("synthesis", records) or [[]]
         for batch in batches:
             data = self.call("synthesis", batch, final_batch=len(batches) == 1)
@@ -570,16 +668,20 @@ class _Run:
                 # The SDK's same matcher, applied to the immutable public OCR
                 # snapshot: no N full S3 downloads for N quotes, and no chance
                 # of resolving geometry against a newer version mid-run.
-                locations = [{"doc_id": doc_id, **match} for match in
-                             locate_text([p for p in snapshot["pages"] if p["page_index"] == finding["page"]],
-                                         finding["quote"])]
+                page = [p for p in snapshot["pages"] if p["page_index"] == finding["page"]]
+                locations = locate_text(page, finding["quote"])
+                plain = _plain(finding["quote"])
+                if not locations and plain and plain != finding["quote"]:
+                    # Tables are stored as markdown; the page's word stream has only the cells' words.
+                    locations = locate_text(page, plain)
+                locations = [{"doc_id": doc_id, **match} for match in locations]
                 geometry = "available" if locations else "no_match"
             except Exception:
                 locations = []
                 geometry = "unavailable"
             citations.append({**finding, "name": snapshot["document"].get("name"),
                               "fingerprint": snapshot["fingerprint"], "locations": locations,
-                              "geometry_status": geometry, "match": "exact_normalized", "validation": "literal"})
+                              "geometry_status": geometry, "validation": "literal"})
         # Recheck AFTER geometry resolution. Never publish boxes or text from a
         # replaced document under the initial source identity.
         for doc_id, snapshot in self.snapshots.items():
@@ -616,7 +718,8 @@ class _Run:
                          "all_pages_read": total > 0 and len(reads) == total})
         status = "complete" if not self.reasons else ("partial" if self.structure_seen else "failed")
         return {"contract": CONTRACT, "status": status, "answer": self.answer,
-                "answer_parts": self.parts, "citations": citations, "documents": docs,
+                "answer_parts": self.parts, "citations": citations, "findings_dropped": self.dropped,
+                "documents": docs,
                 "reasons": self.reasons, "pending_stage": self.stage if self.reasons else None,
                 "usage": self.usage, "usage_complete": self.usage_known,
                 "budget_tokens_reserved": self.charged, "calls": self.calls,
@@ -624,6 +727,8 @@ class _Run:
                 "ms": round((time.monotonic() - self.started) * 1000),
                 "notes": ["complete describes the workflow, not exhaustive PDF reading or semantic correctness.",
                           "Citations validate literal stored text, not the model's interpretation or OCR accuracy.",
+                          "A quote differing from its passage only in formatting carries the passage's own text (match: snapped); "
+                          "one that differs in letters or figures is dropped (findings_dropped), never cited.",
                           "Context tokens are estimates with a margin; synchronous storage reads are not preempted."]}
 
     def execute(self):
