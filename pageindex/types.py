@@ -40,6 +40,7 @@ class LocalIndexConfig(TypedDict, total=False):
     summary_reasoning_effort: str
     use_embedded_toc: bool
     optimize: Literal["full", "merge", "off"]
+    pdf_parser: Union[str, dict]
     backend: dict
     storage_path: Union[str, os.PathLike[str]]
     store: Union["DocumentStore", Mapping[str, Any]]
