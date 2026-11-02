@@ -226,7 +226,8 @@ def test_client_indexes_in_headings_mode_with_the_flash_summaries(tmp_path, samp
     assert features["pdf_extraction"]["headings"]["known"] == 2 and "decisions" not in features["pdf_extraction"]["headings"]
 
 
-def test_headings_mode_needs_liteparse_and_a_known_judge(tmp_path, sample_pdf):
+def test_headings_mode_needs_liteparse_and_a_known_judge(tmp_path, sample_pdf, monkeypatch):
+    monkeypatch.delenv("TYPESAFE_AI_API_KEY", raising=False)
     client = PageIndexClient(storage_path=str(tmp_path / "store"))
     with pytest.raises(PageIndexAPIError, match="pdf_parser='liteparse'"):
         client.submit_document(sample_pdf, mode="headings")

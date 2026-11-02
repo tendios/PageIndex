@@ -36,6 +36,19 @@ import re
 # helpers and their asyncio tasks without threading it through every call.
 _llm_backend: contextvars.ContextVar = contextvars.ContextVar(
     "pageindex_llm_backend", default=None)
+# The language of the summaries and the document description: None for the document's own language (the
+# prompts never state one otherwise and the model answers in English), or a language name to force.
+_summary_language: contextvars.ContextVar = contextvars.ContextVar(
+    "pageindex_summary_language", default=None)
+
+
+def summary_language_instruction(language=None):
+    """The sentence every summary prompt carries so the answer is in the document's language, or the one set."""
+    language = language or _summary_language.get()
+    if language:
+        return f"Write it in {language}."
+    return ("Write it in the language of the given text (the document's own language, e.g. Spanish or Catalan), "
+            "never translating it into English unless the text itself is in English.")
 
 # Same scope: per model the operation calls, the kwargs chosen_effort
 # carries the backend's reasoning_effort to that model with.
@@ -1165,6 +1178,7 @@ def add_node_text_with_labels(node, pdf_pages):
 
 async def generate_node_summary(node, model=None):
     prompt = f"""You are given a part of a document, your task is to generate a description of the partial document about what are main points covered in the partial document.
+    {summary_language_instruction()}
 
     Partial Document Text: {node['text']}
     
@@ -1741,6 +1755,7 @@ class SummaryScheduler:
         prompt = f"""You are given a text chunk from a document.
     Your task is to generate a concise description of everything that is covered in the text, summarizing all its points without omitting any type of content.
     Keep the description concise and to the point, avoiding unnecessary details, within {self._max_words} words.{ask_title}
+    {summary_language_instruction()}
 
     Given Text: {text}
 
@@ -1767,6 +1782,7 @@ class SummaryScheduler:
         prompt = f"""You are given a section of a document: the text that opens the section (possibly empty) and the titles and summaries of its subsections.
     Your task is to generate a concise description of everything that is covered in the whole section, summarizing all its points without omitting any type of content.
     Keep the description concise and to the point, avoiding unnecessary details, within {self._max_words} words.
+    {summary_language_instruction()}
 
     Section Title: {node.get('title', '')}
 
@@ -1902,6 +1918,7 @@ def create_clean_structure_for_description(structure, top_level_only=False):
 def generate_doc_description(structure, model=None):
     prompt = f"""Your are an expert in generating descriptions for a document.
     You are given a structure of a document. Your task is to generate a one-sentence description for the document, which makes it easy to distinguish the document from other documents.
+    {summary_language_instruction()}
         
     Document Structure: {structure}
     

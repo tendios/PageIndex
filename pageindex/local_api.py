@@ -49,7 +49,8 @@ class LocalAPI:
                  summary_reasoning_effort: str | None = None,
                  store: DocumentStore | None = None,
                  pdf_parser: str | dict | None = None,
-                 heading_judge: str | dict | None = None):
+                 heading_judge: str | dict | None = None,
+                 summary_language: str | None = None):
         self._store = store if store is not None else FileDocumentStore(storage_path)
         self._model = model
         self._summary_model = summary_model
@@ -63,6 +64,8 @@ class LocalAPI:
         self._pdf_parser = parser_config(pdf_parser)
         # mode="headings": who decides the lines no rule settles; None or "none" leaves them to the rules.
         self._heading_judge = heading_judge
+        # The language of summaries and description: None for the document's own, or a language name to force.
+        self._summary_language = summary_language
         from .utils import ConfigLoader
         self._config_loader = ConfigLoader()
 
@@ -73,11 +76,13 @@ class LocalAPI:
         each of `models`, the ones the operation calls, as chosen_effort
         carries it to that one, or fails first."""
         from .integrations.claude_agent_sdk import is_claude_code
-        from .utils import _llm_backend, _llm_effort, _llm_usage, chosen_effort
+        from .utils import (_llm_backend, _llm_effort, _llm_usage,
+                            _summary_language, chosen_effort)
         backend = self._index_backend
         effort = (backend or {}).get("reasoning_effort")
         token = _llm_backend.set(backend)  # chosen_effort reads it
         usage_token = _llm_usage.set(usage)
+        language_token = _summary_language.set(self._summary_language)
         effort_token = None
         try:
             effort_token = _llm_effort.set({
@@ -88,6 +93,7 @@ class LocalAPI:
         finally:
             if effort_token is not None:
                 _llm_effort.reset(effort_token)
+            _summary_language.reset(language_token)
             _llm_usage.reset(usage_token)
             _llm_backend.reset(token)
 
