@@ -106,6 +106,28 @@ def test_save_and_read_back(store):
     assert store.get_pages("pi-a") == PAGES
 
 
+def test_liteparse_geometry_survives_store_and_copy(store, tmp_path):
+    from pageindex.pdf_extraction import _page_record, parser_config
+    word = {"text": "Almacén General", "x": 20, "y": 30, "width": 80, "height": 10}
+    pages = [_page_record({"page_num": n, "width": 200, "height": 300,
+                          "text": word["text"], "text_items": [{**word, "words": [word]}],
+                          "blocks": [{"kind": "paragraph", "text": word["text"], "bbox": word}]},
+                         parser_config("liteparse"), True) for n in (1, 2)]
+    meta = {**make_meta("pi-layout"), "pdf_extraction": {"parser": "liteparse", "ocr_pages": [1, 2]}}
+    store.save_document("pi-layout", meta, TREE, pages)
+    assert store.get_pages("pi-layout") == pages
+    target = FileDocumentStore(str(tmp_path / "copied-layout"))
+    copy(store, target)
+    # A fresh default-reader client can read the persisted layout without OCR.
+    for saved in (store, target):
+        client = PageIndexClient(index={"model": "m", "store": saved})
+        assert client.get_ocr("pi-layout")["features"]["pdf_extraction"] == meta["pdf_extraction"]
+        assert client.get_block("pi-layout", "p2_text_1")["bbox"] == [100, 100, 500, 400 / 3]
+        assert client.get_text_locations("pi-layout", "Almacén General", "2")[0]["page"] == 2
+        answer = '<cite doc="report.pdf" page="2" block="p2_text_1"/>'
+        assert client.get_citations(answer, "pi-layout")[0]["bbox"] == pages[1]["blocks"][0]["bbox"]
+
+
 def test_missing_document(store):
     assert store.get_meta("pi-none") is None
     assert store.get_tree("pi-none") is None

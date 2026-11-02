@@ -32,18 +32,69 @@
 Este fork parte de [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) `v0.5.0` y se publica con etiquetas `v<upstream>-tendios.<n>` (versión del paquete `<upstream>+tendios.<n>`); fija una etiqueta, nunca `main`:
 
 ```bash
-pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.1"
+pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.2"
 ```
 
 ### Diferencias con upstream
 
-Solo en modo local; el modo cloud, el modo standard y el OCR no cambian.
+Las extensiones de indexado se activan en modo local; el modo cloud conserva su API.
 
 - **Almacenes** (`pageindex/stores/`): `PageIndexClient(index={"store": ...})` acepta `FileDocumentStore` (el de siempre, por defecto), `S3DocumentStore` (extra `[s3]`, compatible con MinIO) o `SqlDocumentStore` (extra `[sql]`), una instancia o `{"type": "file"|"s3"|"sql", ...}`. Mismo JSON y mismos ids en todos; `pageindex.stores.copy(origen, destino)` migra un índice. Ver [Storage backends](#storage-backends).
 - **`prefix` / `schema` en `SqlDocumentStore`**: `prefix="lib_a_"` antepone el prefijo a las tres tablas (documentos, `pageindex_library`, `pageindex_store_lock`) y `schema="lib_a"` (Postgres) las pone en ese esquema; con el mismo URL, cada prefijo o esquema es un almacén independiente con su propio cerrojo.
 - **`doc_id` externo**: `submit_document(..., doc_id="contrato-42")` indexa con ese id (1–128 caracteres `[A-Za-z0-9._-]`). Si ya existe, error 409.
 - **`if_exists="replace"`**: con `doc_id`, reindexa y sustituye el documento bajo el mismo id.
 - **Vista de biblioteca**: con `doc_id` como lista, el primer mensaje del chat lleva, por documento, nombre, metadatos, descripción y árbol (sin texto), recortado a niveles 1-2 por encima de `client.library_view_max_tokens` (12 000). La herramienta `get_library_structure(doc_names)` devuelve lo mismo en una llamada. `client.library_view = False` vuelve al comportamiento de upstream. Opcional: `client.build_library_topics()` construye un índice de temas con el modelo de indexado y `client.library_topics = True` lo muestra.
+- **LiteParse opcional**: OCR por página con `pdf-inspector`, contenido compartido por el índice y el chat, bloques y cajas de palabras persistidos. Ver la configuración siguiente.
+
+### LiteParse, OCR y citas con coordenadas
+
+Instalación de la versión del fork con LiteParse:
+
+```bash
+pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.2"
+```
+
+Para desarrollar desde este checkout:
+
+```bash
+pip install -e '.[liteparse]'
+```
+
+```python
+from pageindex import PageIndexClient
+
+# ANTHROPIC_API_KEY en el entorno; también admite otros modelos/proveedores.
+client = PageIndexClient(
+    index={
+        "model": "anthropic/claude-haiku-5-5",
+        "pdf_parser": {"name": "liteparse", "ocr_mode": "auto", "ocr_language": "spa"},
+        "storage_path": ".pageindex",
+    },
+    chat="anthropic/claude-haiku-5-5",
+)
+doc_id = client.submit_document("contrato.pdf")["doc_id"]
+response = client.chat("¿Dónde se entrega el suministro? Cita el documento.",
+                       doc_id=doc_id, protocol="chat_completions", citations=True)
+answer = response["choices"][0]["message"]["content"]
+citations = client.get_citations(answer, doc_id=doc_id)
+# Las citas válidas por bloque incluyen page, block_id, bbox y text.
+locations = client.get_text_locations(doc_id, "Almacén General", pages="18")
+# Cada coincidencia literal devuelve cajas por palabra/glifo y página física.
+```
+
+`pdf_parser="liteparse"` es el atajo de esa configuración. También existe el argumento plano `PageIndexClient(model="...", pdf_parser="liteparse")`. Omitirlo, o usar `"default"`, conserva PyPDF2/PDFium. No se reescriben los documentos ya indexados: necesitan reindexación para añadir OCR y geometría.
+
+- `ocr_mode`: `"auto"` inspecciona y repite solo las páginas que necesitan OCR; `"enabled"` habilita el OCR de LiteParse en todas las páginas; `"disabled"` usa solo texto nativo. Por defecto usa Tesseract local; `ocr_server_url` permite el servidor HTTP compatible usado en `rag`. El idioma predeterminado es `spa`.
+- `text_format`: `"auto"` usa bloques/Markdown y conserva el texto espacial cuando detecta varias columnas que LiteParse no ha reconocido como tabla. `"markdown"` y `"spatial"` permiten fijar la representación. Conservar columnas no garantiza interpretar correctamente una tabla.
+- Flash mantiene PDFium para detectar la jerarquía y recibe el texto de LiteParse para expandir y resumir. Si no hay jerarquía y hay más de diez páginas, el cliente recurre al indexador standard con ese mismo texto OCR. Si has fijado opciones de resumen exclusivas de Flash, pide retirarlas en vez de ignorarlas. `mode="standard"` también admite el adaptador directamente.
+- `get_ocr(doc_id)["features"]["pdf_extraction"]` expone versiones, tiempos, páginas dirigidas a OCR y, cuando aplica, `structure_backend="standard_fallback"`. Cada página conserva `layout` con los bloques originales, palabras, dimensiones, rotaciones del texto y confianza OCR. No se envían las coordenadas al modelo.
+- `get_block()` y `get_citations()` usan el contrato existente: `bbox=[x0,y0,x1,y1]`, origen superior izquierdo y coordenadas **0–1000** relativas a la página mostrada. `bbox_points` y `layout` conservan las coordenadas originales en puntos a 72 DPI; la rotación del PDF ya está aplicada. Los identificadores de bloque son estables dentro del índice guardado, no entre reindexaciones.
+- `get_text_locations()` busca texto literal con normalización Unicode y de espacios, devuelve **todas** las coincidencias y no adivina paráfrasis ni citas con elipsis. Los PDF antiguos sin geometría devuelven `[]`. Las cajas suelen ser de palabras; el motor puede devolver glifos o una caja de línea. Una coincidencia sobre OCR valida el texto reconocido, no su exactitud respecto a la imagen.
+- Una cita por bloque puede abarcar un párrafo, una tabla o toda una página cuando solo se conserva texto espacial. Para resaltar una frase concreta, usa `get_text_locations()`. Un bloque inexistente o citado en una página incorrecta no recibe bbox local.
+
+El extra es independiente de `rag` y no cambia `pageindex-service`; el servicio puede adoptarlo al instalar esta revisión y pasar `pdf_parser` al cliente. Su validación de entrada también debe admitir PDF escaneados cuando se active OCR. Los bbox aumentan el tamaño del índice almacenado; el tiempo de OCR y el del modelo se miden por separado.
+
+La librería aporta extracción y geometría genéricas. La recuperación de evidencias para reglas, el registro de cobertura y la caché pertenecen a la capa de servicio; las reglas y los veredictos de coherencia pertenecen al consumidor. Estas funciones no se activan al indexar o consultar un documento.
 
 ### Rebasar sobre upstream
 
