@@ -1128,7 +1128,10 @@ def _get_page_content(client, doc_name: str, pages: str,
     budget = _CHAR_BUDGET
     for page in valid_pages:
         item = by_index.get(page)
-        markdown = item.get("markdown") if item else None
+        # LiteParse adds stable block references, but keeps all coordinates
+        # out of the model context. get_citations resolves them in the store.
+        markdown = (item.get("citation_markdown", item.get("markdown"))
+                    if item else None)
         text = (markdown if isinstance(markdown, str)
                 else f"Page {page} content not available")
         entry = {"page": page, "text": text}
@@ -1794,8 +1797,8 @@ _AGENT_INSTRUCTIONS_NO_LIBRARY = "\n\n".join(_SECTIONS)
 
 # Frozen from the cloud MCP server's ``cited_answer`` prompt, minus the
 # bullet naming the cloud-only get_document_image() tool. Local page
-# content carries no block_id, so the block rules stay dormant and
-# citations resolve to pages.
+# content from legacy readers has no block_id, so its citations resolve
+# to pages. LiteParse content activates the existing block-level rules.
 LOCAL_CITATION_PROMPTS: dict[str, str] = {
     "markdown": """\
 GROUNDING
@@ -1823,7 +1826,7 @@ CITATIONS
 def fetch_citation_prompt(client, format: str) -> str:
     """The MCP server's ``cited_answer`` prompt as system-prompt text;
     ``format`` rides as its one argument. Local: the frozen copy,
-    page-level."""
+    page-level for legacy documents, block-level for LiteParse."""
     if format not in LOCAL_CITATION_PROMPTS:
         raise PageIndexAPIError(
             f"citations format {format!r} is not one of "

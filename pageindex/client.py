@@ -158,7 +158,7 @@ def _needs_model(surface: str) -> PageIndexAPIError:
 
 _LOCAL_INDEX_KEYS = ("model", "summary_model", "backend", "storage_path",
                      "store", "summary_max_words", "summary_concurrency",
-                     "summary_reasoning_effort", "use_embedded_toc", "optimize")
+                     "summary_reasoning_effort", "use_embedded_toc", "optimize", "pdf_parser")
 
 # Near-synonyms of "cloud" that would otherwise parse as model names —
 # a silent wrong mode. They error, pointing at the real word.
@@ -185,7 +185,7 @@ _ARG_TYPES: "dict[str, tuple[type, ...]]" = {
     "model": (str,), "index_model": (str,), "summary_model": (str,),
     "chat_model": (str,), "retrieve_model": (str,), "summary_max_words": (int,),
     "summary_concurrency": (int,), "summary_reasoning_effort": (str,),
-    "use_embedded_toc": (bool,), "optimize": (str,),
+    "use_embedded_toc": (bool,), "optimize": (str,), "pdf_parser": (str, Mapping),
     "storage_path": (str, os.PathLike), "store": (DocumentStore, Mapping),
     "index_backend": (dict,),
     "chat_backend": (dict,)}
@@ -365,7 +365,7 @@ class PageIndexClient:
             dict: ``{"api_key": ...}`` for cloud, ``{"model",
             "summary_model", "backend", "storage_path",
             "summary_max_words", "summary_concurrency",
-            "summary_reasoning_effort", "use_embedded_toc", "optimize",
+            "summary_reasoning_effort", "use_embedded_toc", "optimize", "pdf_parser",
             "store"}`` for local — ``store`` is a ``pageindex.stores``
             DocumentStore or a dict such as ``{"type": "s3", "bucket":
             ...}`` / ``{"type": "sql", "url": ...}``, in place of
@@ -465,6 +465,11 @@ class PageIndexClient:
         optimize (str, optional): Local mode only — the flash tree
             refinement pass: ``"full"`` (merge + model expand, the
             default), ``"merge"`` (deterministic merge only) or ``"off"``.
+        pdf_parser (str | dict, optional): Local PDF reader: ``"default"``
+            preserves the existing readers; ``"liteparse"`` enables optional
+            OCR and layout. A dict accepts name="liteparse", ocr_mode
+            (auto/enabled/disabled), ocr_language (spa), ocr_server_url,
+            and text_format (auto/markdown/spatial). Requires [liteparse].
         retrieve_model (str, optional): Legacy name for ``chat_model`` —
             same meaning everywhere, cloud clients included.
         storage_path (str or os.PathLike, optional): Local mode only —
@@ -527,6 +532,7 @@ class PageIndexClient:
         summary_reasoning_effort: Optional[str] = None,
         use_embedded_toc: Optional[bool] = None,
         optimize: Optional[str] = None,
+        pdf_parser: Optional[Union[str, Mapping[str, Any]]] = None,
         retrieve_model: Optional[str] = None,
         storage_path: Optional[Union[str, os.PathLike[str]]] = None,
         index_backend: Optional[dict[str, Any]] = None,
@@ -557,6 +563,7 @@ class PageIndexClient:
              ("summary_reasoning_effort", summary_reasoning_effort),
              ("use_embedded_toc", use_embedded_toc),
              ("optimize", optimize),
+             ("pdf_parser", pdf_parser),
              ("index_backend", index_backend),
              ("storage_path", storage_path), ("model", model))
             if value is not None}
@@ -644,6 +651,12 @@ class PageIndexClient:
                 if name == "optimize" and value not in ("full", "merge", "off"):
                     raise PageIndexAPIError(
                         f'{shown} must be "full", "merge" or "off", got {value!r}.')
+                if name == "pdf_parser":
+                    from .pdf_extraction import parser_config
+                    try:
+                        conf[name] = parser_config(value)
+                    except (ValueError, TypeError) as exc:
+                        raise PageIndexAPIError(f"{shown}: {exc}") from exc
                 if (name in ("summary_max_words", "summary_concurrency")
                         and isinstance(value, int) and value < 1):
                     raise PageIndexAPIError(
@@ -737,6 +750,7 @@ class PageIndexClient:
                 use_embedded_toc=index_conf.get("use_embedded_toc", True),
                 optimize=index_conf.get("optimize", "full"),
                 summary_reasoning_effort=index_conf.get("summary_reasoning_effort"),
+                pdf_parser=index_conf.get("pdf_parser"),
             )
             # LiteLLM's multi-second import would otherwise land on the
             # first chat call; failures resurface there with real context.
@@ -945,9 +959,9 @@ class PageIndexClient:
             dict: {'doc_id', 'status', 'retrieval_ready', 'result', ...}.
             With 'page', result entries are {'page_index', 'markdown', ...}.
 
-        Local: the "OCR" result is the text extracted from the PDF while
-        indexing (no OCR model runs locally, so scanned/image-only PDFs have
-        no local text).
+        Local: text extracted while indexing. With pdf_parser='liteparse',
+        entries also retain layout blocks and word boxes; features contains
+        extraction timing and OCR routing. The default reader has no OCR.
         """
         return self._api.get_ocr(doc_id=doc_id, format=format)
 
@@ -974,10 +988,10 @@ class PageIndexClient:
 
     def get_block(self, doc_id: str, block_id: str) -> dict[str, Any]:
         """
-        One layout block of a cloud document — the page, bounding box, type
+        One layout block of a cloud or local LiteParse document — page, box, type
         and content behind a ``block_id`` from page content or a
-        block-level citation. Cloud-only: local page content has no
-        blocks, so local mode raises PageIndexAPIError.
+        block-level citation. Legacy local documents have no blocks and
+        must be reindexed with pdf_parser='liteparse'.
 
         Args:
             doc_id (str): Document ID.
@@ -992,10 +1006,26 @@ class PageIndexClient:
             ``status_code == 404`` when the document or the block does not
             exist.
         """
-        return self._require_cloud(
-            "get_block is cloud-only — local page content has no layout "
-            "blocks. Create the client with an api_key to look up blocks."
-        ).get_block(doc_id=doc_id, block_id=block_id)
+        return self._api.get_block(doc_id=doc_id, block_id=block_id)
+
+    def get_text_locations(self, doc_id: str, quote: str,
+                           pages: Optional[str] = None) -> list[dict[str, Any]]:
+        """Locate a literal quote in stored LiteParse words, without an LLM.
+
+        Optional ``pages`` uses the usual physical-page spec ("3,5-7").
+        Returns all exact matches after Unicode/whitespace normalization,
+        with word boxes in top-left 0..1000 coordinates and original points.
+        No layout or no match returns []; paraphrases and ellipses are not
+        guessed. Repeated quotes can have multiple matches. OCR matches refer
+        to recognized text, not a guarantee that recognition was correct.
+        """
+        from .pdf_extraction import locate_text
+        content = (self.get_page_content(doc_id, pages) if pages is not None
+                   else self.get_ocr(doc_id)["result"])
+        try:
+            return [{"doc_id": doc_id, **match} for match in locate_text(content or [], quote)]
+        except ValueError as exc:
+            raise PageIndexAPIError(str(exc)) from exc
 
     def get_page_image(self, doc_id: str, page: int) -> str:
         """
@@ -2674,8 +2704,8 @@ class PageIndexClient:
         renders — the default) or ``"markdown"`` (a bracketed
         ``[doc, p. N]`` reference, for hosts that strip tags); any
         other value raises. Local documents: the SDK's
-        frozen copy of the same prompt (page-level — local page
-        content has no blocks).
+        frozen copy of the same prompt (block-level for LiteParse documents,
+        page-level for legacy local documents).
         """
         from .agent_tools import fetch_citation_prompt
         return fetch_citation_prompt(self, format or "cite")
@@ -2687,7 +2717,7 @@ class PageIndexClient:
     ) -> list[dict[str, Any]]:
         """
         The citations in a cited answer, each with the id of the document
-        it names and, for a block-level citation on a cloud document, the
+        it names and, for a block-level citation on a cloud or LiteParse document, the
         block behind it from ``get_block()`` — page, bounding box, type and
         content: the managed chat's ``citations`` entries, plus ``doc_id``
         and the block's ``text``. Reads both tag formats PageIndex chat
@@ -2711,8 +2741,8 @@ class PageIndexClient:
             the block's fields as ``get_block()`` returns them (``'bbox'``,
             ``'block_type'``, ...) for a block-level one. A document not in
             the library keeps ``doc_id: None``; a block the document does
-            not have (a model's slip), or that cannot be looked up (local
-            mode, a document you cannot read), keeps its citation without
+            not have (a model's slip), or that cannot be looked up (legacy
+            local index, a document you cannot read), keeps its citation without
             a bbox.
         """
         if not isinstance(answer, str):
@@ -2754,7 +2784,11 @@ class PageIndexClient:
                 entry["block_id"] = block_id
                 if entry["doc_id"]:
                     try:
-                        entry.update(self.get_block(entry["doc_id"], block_id))
+                        block = self.get_block(entry["doc_id"], block_id)
+                        # Reject mismatched local geometry; retain the cloud
+                        # API's existing behavior of resolving the real page.
+                        if getattr(self, "api_key", None) or block.get("page") == entry["page"]:
+                            entry.update(block)
                     except PageIndexAPIError as exc:
                         # Local raises carry no status; 429/5xx propagate.
                         if exc.status_code not in (None, 403, 404):
@@ -3047,6 +3081,7 @@ class PageIndexLocalClient(PageIndexClient):
         summary_reasoning_effort: Optional[str] = None,
         use_embedded_toc: Optional[bool] = None,
         optimize: Optional[str] = None,
+        pdf_parser: Optional[Union[str, Mapping[str, Any]]] = None,
         retrieve_model: Optional[str] = None,
         storage_path: Optional[Union[str, os.PathLike[str]]] = None,
         index_backend: Optional[dict[str, Any]] = None,
@@ -3060,6 +3095,7 @@ class PageIndexLocalClient(PageIndexClient):
                          summary_concurrency=summary_concurrency,
                          summary_reasoning_effort=summary_reasoning_effort,
                          use_embedded_toc=use_embedded_toc, optimize=optimize,
+                         pdf_parser=pdf_parser,
                          retrieve_model=retrieve_model, storage_path=storage_path,
                          index_backend=index_backend, chat_backend=chat_backend,
                          instructions=instructions)
