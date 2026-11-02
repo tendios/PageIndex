@@ -159,7 +159,7 @@ def _needs_model(surface: str) -> PageIndexAPIError:
 _LOCAL_INDEX_KEYS = ("model", "summary_model", "backend", "storage_path",
                      "store", "summary_max_words", "summary_concurrency",
                      "summary_reasoning_effort", "use_embedded_toc", "optimize", "pdf_parser",
-                     "heading_judge")
+                     "heading_judge", "summary_language")
 
 # Near-synonyms of "cloud" that would otherwise parse as model names —
 # a silent wrong mode. They error, pointing at the real word.
@@ -187,7 +187,7 @@ _ARG_TYPES: "dict[str, tuple[type, ...]]" = {
     "chat_model": (str,), "retrieve_model": (str,), "summary_max_words": (int,),
     "summary_concurrency": (int,), "summary_reasoning_effort": (str,),
     "use_embedded_toc": (bool,), "optimize": (str,), "pdf_parser": (str, Mapping),
-    "heading_judge": (str, Mapping),
+    "heading_judge": (str, Mapping), "summary_language": (str,),
     "storage_path": (str, os.PathLike), "store": (DocumentStore, Mapping),
     "index_backend": (dict,),
     "chat_backend": (dict,)}
@@ -368,7 +368,7 @@ class PageIndexClient:
             "summary_model", "backend", "storage_path",
             "summary_max_words", "summary_concurrency",
             "summary_reasoning_effort", "use_embedded_toc", "optimize", "pdf_parser",
-            "heading_judge", "store"}`` for local — ``store`` is a ``pageindex.stores``
+            "heading_judge", "summary_language", "store"}`` for local — ``store`` is a ``pageindex.stores``
             DocumentStore or a dict such as ``{"type": "s3", "bucket":
             ...}`` / ``{"type": "sql", "url": ...}``, in place of
             ``storage_path``. An
@@ -472,6 +472,9 @@ class PageIndexClient:
             (Jev, key from ``TYPESAFE_AI_API_KEY`` or ``{"name": "typesafe",
             "api_key": ..., "model": ..., "base_url": ...}``) or ``"none"``
             (the rules alone). Defaults to none.
+        summary_language (str, optional): Local mode only — the language of
+            the node summaries and the document description: unset, the
+            document's own language; a language name («Spanish») forces it.
         pdf_parser (str | dict, optional): Local PDF reader: ``"default"``
             preserves the existing readers; ``"liteparse"`` enables optional
             OCR and layout. A dict accepts name="liteparse", ocr_mode
@@ -541,6 +544,7 @@ class PageIndexClient:
         optimize: Optional[str] = None,
         pdf_parser: Optional[Union[str, Mapping[str, Any]]] = None,
         heading_judge: Optional[Union[str, Mapping[str, Any]]] = None,
+        summary_language: Optional[str] = None,
         retrieve_model: Optional[str] = None,
         storage_path: Optional[Union[str, os.PathLike[str]]] = None,
         index_backend: Optional[dict[str, Any]] = None,
@@ -573,6 +577,7 @@ class PageIndexClient:
              ("optimize", optimize),
              ("pdf_parser", pdf_parser),
              ("heading_judge", heading_judge),
+             ("summary_language", summary_language),
              ("index_backend", index_backend),
              ("storage_path", storage_path), ("model", model))
             if value is not None}
@@ -766,6 +771,7 @@ class PageIndexClient:
                 summary_reasoning_effort=index_conf.get("summary_reasoning_effort"),
                 pdf_parser=index_conf.get("pdf_parser"),
                 heading_judge=index_conf.get("heading_judge"),
+                summary_language=index_conf.get("summary_language"),
             )
             # LiteLLM's multi-second import would otherwise land on the
             # first chat call; failures resurface there with real context.
@@ -3098,6 +3104,7 @@ class PageIndexLocalClient(PageIndexClient):
         optimize: Optional[str] = None,
         pdf_parser: Optional[Union[str, Mapping[str, Any]]] = None,
         heading_judge: Optional[Union[str, Mapping[str, Any]]] = None,
+        summary_language: Optional[str] = None,
         retrieve_model: Optional[str] = None,
         storage_path: Optional[Union[str, os.PathLike[str]]] = None,
         index_backend: Optional[dict[str, Any]] = None,
