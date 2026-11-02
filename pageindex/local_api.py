@@ -47,7 +47,8 @@ class LocalAPI:
                  use_embedded_toc: bool = True,
                  optimize: str = "full",
                  summary_reasoning_effort: str | None = None,
-                 store: DocumentStore | None = None):
+                 store: DocumentStore | None = None,
+                 pdf_parser: str | dict | None = None):
         self._store = store if store is not None else FileDocumentStore(storage_path)
         self._model = model
         self._summary_model = summary_model
@@ -57,6 +58,8 @@ class LocalAPI:
         self._summary_concurrency = summary_concurrency
         self._use_embedded_toc = use_embedded_toc
         self._optimize = optimize
+        from .pdf_extraction import parser_config
+        self._pdf_parser = parser_config(pdf_parser)
         from .utils import ConfigLoader
         self._config_loader = ConfigLoader()
 
@@ -150,8 +153,14 @@ class LocalAPI:
                 "Failed to submit document: only PDF files are supported in local mode."
             )
 
+        extraction = None
         try:
-            page_texts = self._extract_page_texts(file_path)
+            if self._pdf_parser["name"] == "liteparse":
+                from .pdf_extraction import extract_liteparse
+                extraction = extract_liteparse(file_path, self._pdf_parser)
+                page_texts = extraction.texts
+            else:
+                page_texts = self._extract_page_texts(file_path)
         except PageIndexAPIError:
             raise
         except Exception as e:
@@ -171,7 +180,8 @@ class LocalAPI:
         try:
             if mode == "flash":
                 structure, description = run_off_loop(
-                    self._with_backend, usage, self._index_flash, file_path
+                    self._with_backend, usage, self._index_flash, file_path,
+                    *([extraction] if extraction is not None else [])
                 )
             else:
                 structure, description = run_off_loop(
@@ -190,8 +200,8 @@ class LocalAPI:
 
         if doc_id is None:
             doc_id = "pi-" + uuid.uuid4().hex
-        pages = [{"page_index": i + 1, "markdown": text}
-                 for i, text in enumerate(page_texts)]
+        pages = extraction.pages if extraction is not None else [
+            {"page_index": i + 1, "markdown": text} for i, text in enumerate(page_texts)]
         from .utils import remove_fields
         # Check-then-write under the store lock; the early pre-check above
         # is advisory only.
@@ -210,6 +220,8 @@ class LocalAPI:
                 "metadata": metadata,
                 "mode": mode,
             }
+            if extraction is not None:
+                meta["pdf_extraction"] = extraction.metadata
             self._store.save_document(
                 doc_id, meta, remove_fields(structure, fields=["text"]), pages)
         return {"doc_id": doc_id, "name": meta["name"], "usage": usage}
@@ -314,7 +326,7 @@ class LocalAPI:
             )
         return structure, result.get("doc_description")
 
-    def _index_flash(self, file_path: str) -> tuple[list, str | None]:
+    def _index_flash(self, file_path: str, extraction=None) -> tuple[list, str | None]:
         from .flash import page_index_flash
         from .flash.api import flash_rejection_reason
         from .utils import (create_clean_structure_for_description,
@@ -326,9 +338,26 @@ class LocalAPI:
                                   summary_concurrency=self._summary_concurrency,
                                   summary_max_words=self._summary_max_words,
                                   summary_reasoning_effort=self._summary_reasoning_effort,
-                                  use_embedded_toc=self._use_embedded_toc)
+                                  use_embedded_toc=self._use_embedded_toc,
+                                  **({"page_texts": extraction.texts}
+                                     if extraction is not None else {}))
         structure = result.get("structure", [])
         reason = flash_rejection_reason(result)
+        if reason and extraction is not None and result.get("toc_source") == "pages":
+            # OCR gives us text but cannot recover the native font geometry
+            # Flash uses for headings. Its large flat-tree refusal occurs
+            # before any LLM calls; build a proper tree with the existing
+            # standard backend, using exactly the same extracted pages.
+            if any(value is not None for value in (self._summary_max_words,
+                                                   self._summary_concurrency,
+                                                   self._summary_reasoning_effort)):
+                raise PageIndexAPIError(
+                    "Failed to submit document: OCR recovered text but Flash found no "
+                    "hierarchy. Standard fallback cannot honor flash-only summary "
+                    "options; remove those options and use mode='standard'.")
+            logger.info("LiteParse: no usable layout hierarchy; using standard indexing")
+            extraction.metadata["structure_backend"] = "standard_fallback"
+            return self._index_standard(file_path, extraction.texts)
         if reason:
             raise PageIndexAPIError(f"Failed to submit document: {reason}")
         write_node_id(structure)
@@ -386,6 +415,19 @@ class LocalAPI:
                 result = "\n\n".join(p.get("markdown", "") for p in pages)
         return self._completed_envelope(doc_id, result, meta)
 
+    def get_block(self, doc_id: str, block_id: str) -> dict[str, Any]:
+        self._require_doc(doc_id, "Failed to get block")
+        pages = self._require_pages(doc_id, "Failed to get block")
+        if not any("blocks" in page for page in pages):
+            raise PageIndexAPIError(
+                "get_block is cloud-only for legacy documents; reindex locally "
+                "with pdf_parser='liteparse' to retain layout blocks.")
+        for page in pages:
+            for block in page.get("blocks") or []:
+                if block.get("block_id") == block_id:
+                    return {"doc_id": doc_id, **block}
+        raise PageIndexAPIError(f"Block {block_id!r} not found", status_code=404)
+
     @staticmethod
     def _require_data(data, error_prefix: str):
         if data is None:
@@ -406,7 +448,8 @@ class LocalAPI:
             "retrieval_ready": True,
             "result": result,
             "metadata": meta.get("metadata"),
-            "features": {},
+            "features": ({"pdf_extraction": meta["pdf_extraction"]}
+                         if "pdf_extraction" in meta else {}),
         }
 
     # ── document management ──
