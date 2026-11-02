@@ -59,6 +59,8 @@ def outline_line(c: Candidate, text_chars: int = OUTLINE_TEXT) -> dict[str, Any]
     line["md"] = c.md
     if c.heading_block:
         line["heading"] = True
+    if c.bold:
+        line["bold"] = True
     if "layout" in c.sources:
         line["layout"] = True
     if c.known:

@@ -18,6 +18,7 @@ LETTER_ITEM = re.compile(r"^[a-z]\)\s")
 CHAPTER_WORDS = ("capitol", "capitulo", "titol", "titulo", "seccion", "seccio", "part", "parte")
 ANNEX_WORDS = ("annex", "annexo", "anexo")
 INDEX_PAGE_MIN_ENTRIES = 9
+INDEX_PAGE_MIN_LEADERS = 5
 REPEAT_MIN_PAGES = 3
 MAX_TEXT = 160
 SIMILAR = 0.75
@@ -45,6 +46,10 @@ class Candidate:
     following: str = ""
     # The line carries its own page number («3 Departament…» on page 3, «Página 7 de 113» on page 7): a footer.
     page_numbered: bool = False
+    # Markdown emphasis around the line (**bold**): a hint the judge weighs; the title itself carries none.
+    bold: bool = False
+    # Dot leaders and a page number at the end («3. OBJECTE ........ 12»): an entry of the document's index.
+    leaders: bool = False
 
     @property
     def level_hint(self) -> int:
@@ -155,6 +160,9 @@ def _lines_of(pages: list[dict[str, Any]]) -> list[Candidate]:
                 clean = re.sub(r"^#+\s*", "", first).strip()
                 if kind == "list_item":
                     clean = re.sub(r"^[-*•]\s+", "", clean)
+                bold = "**" in clean or "__" in clean
+                clean = re.sub(r"(\*{1,3}|_{2,3})(?=\S)|(?<=\S)(\*{1,3}|_{2,3})", "", clean).strip()
+                leaders = bool(re.search(r"(?:\.\s?){4,}\s*\d{0,4}\s*$", clean))
                 marker, numbered, keyword = marker_of(clean)
                 heading_block = kind == "heading" or md > 0
                 if not heading_block and not numbered and not keyword:
@@ -167,7 +175,7 @@ def _lines_of(pages: list[dict[str, Any]]) -> list[Candidate]:
                 out.append(Candidate(index=len(out), page=page_no, order=order * 1000 + sub, text=clean, md=md,
                                      heading_block=heading_block, marker=marker, numbered=numbered,
                                      keyword=keyword, sources={"liteparse"}, previous=previous, following=following,
-                                     page_numbered=page_numbered))
+                                     page_numbered=page_numbered, bold=bold, leaders=leaders))
     return out
 
 
@@ -207,16 +215,23 @@ def noise(c: Candidate, repeated: set[str]) -> Optional[str]:
         return "length"
     if re.match(r"^\d{1,2}[.,]\d{3}\b", c.text):
         return "amount"
+    if c.leaders:
+        return "index_entry"  # an entry of the index outside its pages: never the section itself
     return None
 
 
 def index_pages_of(cands: list[Candidate], repeated: set[str]) -> set[int]:
-    """Pages listing nine or more headings: the document's own table of contents."""
-    per_page: dict[int, int] = {}
+    """Pages listing nine or more headings, or five or more lines with dot leaders: the document's own table of
+    contents."""
+    shaped: dict[int, int] = {}
+    with_leaders: dict[int, int] = {}
     for c in cands:
+        if c.leaders:
+            with_leaders[c.page] = with_leaders.get(c.page, 0) + 1
         if heading_shaped(c) and noise(c, repeated) is None:
-            per_page[c.page] = per_page.get(c.page, 0) + 1
-    return {p for p, n in per_page.items() if n >= INDEX_PAGE_MIN_ENTRIES}
+            shaped[c.page] = shaped.get(c.page, 0) + 1
+    return ({p for p, n in shaped.items() if n >= INDEX_PAGE_MIN_ENTRIES}
+            | {p for p, n in with_leaders.items() if n >= INDEX_PAGE_MIN_LEADERS})
 
 
 def _located_index_entries(entries: list[Candidate], pages: list[dict[str, Any]], last_index_page: int) -> list[tuple[int, int, str]]:
@@ -260,7 +275,7 @@ def collect(pages: list[dict[str, Any]], layout_structure: Optional[list[dict]] 
     repeated = repeated_texts(lines)
     index_pages = index_pages_of(lines, repeated)
     kept: list[Candidate] = []
-    dropped = {"repeated": 0, "table": 0, "letter_item": 0, "length": 0, "amount": 0, "index_page": 0}
+    dropped = {"repeated": 0, "table": 0, "letter_item": 0, "length": 0, "amount": 0, "index_entry": 0, "index_page": 0}
     for c in lines:
         if c.page in index_pages:
             dropped["index_page"] += 1

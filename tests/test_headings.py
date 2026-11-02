@@ -77,6 +77,24 @@ def test_index_pages_place_entries_in_the_body_and_layout_titles_fill_gaps():
     assert all(c.known for c in cands if "toc" in c.sources) and sum("toc" in c.sources for c in cands) == 10
 
 
+def test_an_index_page_written_with_leaders_and_emphasis_is_located_not_copied():
+    """The informe of Open Data BCN: page 2 lists «3. ***TÍTULO ........ 5» lines; they place the body headings,
+    they never become nodes themselves, and the titles carry no asterisks."""
+    entries = [("heading", f"# {i}. ***APARTAT {i} DEL DOCUMENT***......................... {i + 2}") for i in range(1, 8)]
+    pages = [page(1, [("heading", "# INFORME JUSTIFICATIU")]), page(2, entries)]
+    pages += [page(i + 2, [("heading", f"# {i}. APARTAT {i} DEL DOCUMENT"), ("paragraph", "Cos del text")]) for i in range(1, 8)]
+    cands, report = collect(pages)
+    assert report["index_pages"] == [2] and report["dropped"]["index_page"] == 7
+    assert all(c.page != 2 for c in cands) and all("*" not in c.text for c in cands)
+    structure, _ = build_headings_structure(pages, ["p"] * 9)
+    # The two-word title of page 1 is no section: the pages before the first one are the preface, as in flash.
+    assert [n["title"] for n in structure][:3] == ["Preface", "1. APARTAT 1 DEL DOCUMENT", "2. APARTAT 2 DEL DOCUMENT"]
+    assert [n["start_index"] for n in structure][1:4] == [3, 4, 5]
+    # The same line outside an index page, with leaders, is an index entry: never a heading.
+    stray, _ = collect([page(1, [("heading", "# 4. ALTRE APARTAT ............ 9"), ("paragraph", "Text")])])
+    assert stray == []
+
+
 def test_levels_hang_clauses_under_chapters_and_annexes_at_the_top():
     def cand(i, text, page_no):
         from pageindex.headings.candidates import marker_of
