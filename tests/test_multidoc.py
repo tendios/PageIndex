@@ -156,8 +156,12 @@ def test_out_of_scope_read_and_nonliteral_quote_are_rejected(client, monkeypatch
         return script(**kw)
     monkeypatch.setattr(multidoc, "_complete", fabricated)
     result = query(client)
-    assert result["status"] == "partial" and result["citations"] == []
-    assert result["reasons"][0]["code"] == "invalid_quote"
+    # A fabricated quote drops that finding alone: the run completes, nothing is cited, the drop is on record.
+    assert result["status"] == "complete" and result["citations"] == [] and result["reasons"] == []
+    extract_calls = [c for c in result["calls"] if c["stage"] == "extract"]
+    assert len(result["findings_dropped"]) == len(extract_calls) == sum(c["findings_dropped"] for c in extract_calls)
+    assert all(d["reason"] == "invalid_quote" and d["quote"] == "fabricated quotation" and d["doc_id"] and d["page"]
+               for d in result["findings_dropped"])
 
 
 def test_source_replacement_even_with_same_timestamp_and_tree_is_detected(client, monkeypatch):
@@ -335,3 +339,123 @@ def test_bad_extraction_does_not_erase_actual_page_read_coverage(client, monkeyp
     result = query(client)
     assert result["status"] == "partial" and result["citations"] == []
     assert all(d["pages_read"] == [1, 2] and d["extraction_pending"] for d in result["documents"])
+
+
+def test_fit_tolerates_formatting_but_never_letters_or_figures():
+    text = "| Plazo de ejecución | 36 meses |\n| --- | --- |\n| Precio | 2.180.437,62 € «IVA excluido» |"
+    assert multidoc._fit("Plazo de ejecución | 36 meses", text) == ("Plazo de ejecución | 36 meses", "exact_normalized")
+    # Table bars, case, accents, punctuation and quote marks are formatting: the passage's own text is cited.
+    assert multidoc._fit("PLAZO DE EJECUCION: 36 meses", text) == ("Plazo de ejecución | 36 meses", "snapped")
+    assert multidoc._fit('Precio 2.180.437,62 € "IVA excluido"', text) == ("Precio | 2.180.437,62 € «IVA excluido", "snapped")
+    # A figure, a number separator or a word is content: no fit.
+    assert multidoc._fit("Plazo de ejecución 30 meses", text) is None
+    assert multidoc._fit("Precio 2180437,62", text) is None
+    assert multidoc._fit("IVA incluido", text) is None
+    assert multidoc._fit("", text) is None and multidoc._fit("***", text) is None and multidoc._fit(None, text) is None
+    assert multidoc._plain("| Plazo de ejecución | 36 meses |\n| --- | --- |\n| a\\|b<br>c | d |") == "Plazo de ejecución 36 meses a|b c d"
+
+
+def test_formatting_slips_snap_to_the_stored_text_and_keep_geometry(client, monkeypatch):
+    """A quote without the table's bars, in capitals and without accents is a formatting slip, not a fabrication: the
+    citation carries the passage's own characters, says so in ``match``, and its boxes come from the page's words."""
+    from pageindex.pdf_extraction import _page_record, parser_config
+    store = client._api._store
+    cells = [{"text": "Plazo de ejecución", "x": 20, "y": 30, "width": 100, "height": 10},
+             {"text": "36 meses", "x": 130, "y": 30, "width": 50, "height": 10}]
+    raw = {"page_num": 1, "width": 200, "height": 300, "text": "Plazo de ejecución 36 meses",
+           "text_items": [{**c, "words": [c]} for c in cells],
+           "blocks": [{"kind": "table", "header": [{"text": c["text"]} for c in cells], "rows": [],
+                       "bbox": {"x": 20, "y": 30, "width": 160, "height": 10}}]}
+    page = _page_record(raw, parser_config("liteparse"), False)
+    assert page["markdown"].startswith("| Plazo de ejecución | 36 meses |")
+    store.save_document("doc-0", store.get_meta("doc-0"), store.get_tree("doc-0"), [page, {"page_index": 2, "markdown": "Other page"}])
+
+    def cleaned(**kw):
+        body = json.loads(kw["messages"][-1]["content"])
+        if body["phase"] == "extract":
+            return envelope({"findings": [{"source_id": r["source_id"], "note": "n",
+                                          "quote": "PLAZO DE EJECUCION 36 meses" if r["text"].startswith("|") else r["text"]}
+                                         for r in body["records"] if r["text"].strip()]})
+        return script(**kw)
+    monkeypatch.setattr(multidoc, "_complete", cleaned)
+    result = MultiDocumentSearch(client).query("q", doc_ids=["doc-0", "doc-9"])
+    assert result["status"] == "complete" and result["findings_dropped"] == [], result["reasons"]
+    cite = next(c for c in result["citations"] if c["doc_id"] == "doc-0" and c["page"] == 1)
+    assert cite["quote"] == "Plazo de ejecución | 36 meses" and cite["match"] == "snapped" and cite["validation"] == "literal"
+    assert cite["geometry_status"] == "available" and cite["locations"][0]["boxes"]
+    assert cite["locations"] == client.get_text_locations("doc-0", "Plazo de ejecución 36 meses", pages="1")
+    assert all(c["match"] == "exact_normalized" for c in result["citations"] if c["doc_id"] == "doc-9")
+    assert cite["quote"] in result["answer"]
+
+
+def test_a_quote_that_does_not_fit_drops_only_that_finding(client, monkeypatch):
+    """A changed figure or word is never snapped: that finding is dropped and recorded; the batch's other findings
+    are kept, the remaining batches are read and the synthesis runs."""
+    def two_bad_per_batch(**kw):
+        body = json.loads(kw["messages"][-1]["content"])
+        if body["phase"] == "extract":
+            rows = [r for r in body["records"] if r["text"].strip()]
+            findings = [{"source_id": r["source_id"], "quote": r["text"], "note": "ok"} for r in rows]
+            findings.append({"source_id": rows[0]["source_id"], "quote": rows[0]["text"].replace("300", "3000"), "note": "figure"})
+            findings.append({"source_id": rows[0]["source_id"], "quote": rows[0]["text"].replace("except", "including"), "note": "word"})
+            return envelope({"findings": findings})
+        return script(**kw)
+    monkeypatch.setattr(multidoc, "_complete", two_bad_per_batch)
+    result = query(client)
+    assert result["status"] == "complete" and result["reasons"] == [] and result["pending_stage"] is None
+    assert len(result["citations"]) == 20 and all(c["match"] == "exact_normalized" and "relocated_from" not in c
+                                                   for c in result["citations"])
+    assert "doc-9 requirement 2" in result["answer"]
+    extract_calls = [c for c in result["calls"] if c["stage"] == "extract"]
+    assert len(result["findings_dropped"]) == 2 * len(extract_calls) == sum(c["findings_dropped"] for c in extract_calls)
+    assert {d["reason"] for d in result["findings_dropped"]} == {"invalid_quote"}
+    dropped = result["findings_dropped"][0]
+    assert dropped["doc_id"] == "doc-0" and dropped["page"] == 1 and dropped["source_id"].startswith("P0001-000001-")
+    assert "3000 euros" in dropped["quote"]
+    assert all(d["pages_read"] == [1, 2] and d["extraction_pending"] == [] for d in result["documents"])
+
+
+def test_a_quote_attributed_to_the_wrong_passage_is_relocated_only_when_one_passage_holds_it(client, monkeypatch):
+    def misattributed(**kw):
+        body = json.loads(kw["messages"][-1]["content"])
+        if body["phase"] == "extract":
+            rows = [r for r in body["records"] if r["text"].strip()]
+            if len(rows) < 2:
+                return script(**kw)
+            # The first names the second passage but quotes the first; the second names an unread passage.
+            findings = [{"source_id": rows[1]["source_id"], "quote": rows[0]["text"], "note": "swapped"},
+                        {"source_id": "P9999-000001-000000000", "quote": rows[1]["text"], "note": "unknown"}]
+            findings += [{"source_id": r["source_id"], "quote": r["text"], "note": "ok"} for r in rows[2:]]
+            return envelope({"findings": findings})
+        return script(**kw)
+    monkeypatch.setattr(multidoc, "_complete", misattributed)
+    result = query(client)
+    assert result["status"] == "complete" and result["findings_dropped"] == [], result["reasons"]
+    assert len(result["citations"]) == 20
+    relocated = [c for c in result["citations"] if "relocated_from" in c]
+    assert len(relocated) >= 2 and all(c["relocated_from"] != c["source_id"] for c in relocated)
+    for c in relocated:  # the citation names the passage that actually holds the text
+        assert c["quote"].startswith(c["doc_id"]) and f"requirement {c['page']}" in c["quote"]
+    assert all(c["match"] == "exact_normalized" and c["validation"] == "literal" for c in result["citations"])
+    assert "relocated_from" not in result["answer"] and "match" not in json.dumps(result["answer_parts"])
+
+    # The same text in two passages of the batch: nowhere unambiguous to put it, so that finding is dropped.
+    store = client._api._store
+    for doc in ("doc-0", "doc-1"):
+        seed(store, doc, "Identical page text in two documents.")
+    def unknown_source(**kw):
+        body = json.loads(kw["messages"][-1]["content"])
+        if body["phase"] == "extract":
+            rows = [r for r in body["records"] if r["text"].strip()]
+            findings = [{"source_id": r["source_id"], "quote": r["text"], "note": "ok"} for r in rows]
+            findings.append({"source_id": None, "quote": "Identical page text in two documents.", "note": "where?"})
+            findings.append("not an object")
+            return envelope({"findings": findings})
+        return script(**kw)
+    monkeypatch.setattr(multidoc, "_complete", unknown_source)
+    result = MultiDocumentSearch(client).query("q", doc_ids=["doc-0", "doc-1", "doc-2"])
+    assert result["status"] == "complete", result["reasons"]
+    assert [d["reason"] for d in result["findings_dropped"]] == ["invalid_reference", "invalid_response"]
+    assert result["findings_dropped"][0] == {"source_id": None, "doc_id": None, "page": None, "reason": "invalid_reference",
+                                             "quote": "Identical page text in two documents."}
+    assert result["findings_dropped"][1]["quote"] is None
