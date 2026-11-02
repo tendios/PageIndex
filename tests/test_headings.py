@@ -95,6 +95,18 @@ def test_an_index_page_written_with_leaders_and_emphasis_is_located_not_copied()
     assert stray == []
 
 
+def test_a_footer_the_layout_took_for_a_title_is_still_a_footer():
+    """Printed page numbers start after the cover («2 Departament…» on physical page 3): the footer repeats with
+    each page's number and the layout detection sometimes picks one of them as a title."""
+    pages = [page(1, [("heading", "# INFORME")])] + [
+        page(no, [("heading", f"# {no - 1}. APARTAT {no - 1} DEL DOCUMENT"), ("paragraph", "Cos"),
+                  ("paragraph", f"{no - 1} Departament d'Estadística i Difusió de Dades")]) for no in range(2, 8)]
+    layout = [{"title": "2 Departament d'Estadística i Difusió de Dades", "start_index": 3, "end_index": 5}]
+    cands, report = collect(pages, layout)
+    assert all("Departament" not in c.text for c in cands)
+    assert report["dropped"]["repeated"] >= 6 and report["candidates"] == 7
+
+
 def test_levels_hang_clauses_under_chapters_and_annexes_at_the_top():
     def cand(i, text, page_no):
         from pageindex.headings.candidates import marker_of
