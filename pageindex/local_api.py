@@ -49,7 +49,8 @@ class LocalAPI:
                  summary_reasoning_effort: str | None = None,
                  store: DocumentStore | None = None,
                  pdf_parser: str | dict | None = None,
-                 heading_judge: str | dict | None = None):
+                 heading_judge: str | dict | None = None,
+                 summary_language: str | None = None):
         self._store = store if store is not None else FileDocumentStore(storage_path)
         self._model = model
         self._summary_model = summary_model
@@ -63,6 +64,8 @@ class LocalAPI:
         self._pdf_parser = parser_config(pdf_parser)
         # mode="headings": who decides the lines no rule settles; None or "none" leaves them to the rules.
         self._heading_judge = heading_judge
+        # The language of summaries and description: None for the document's own, or a language name to force.
+        self._summary_language = summary_language
         from .utils import ConfigLoader
         self._config_loader = ConfigLoader()
 
@@ -70,12 +73,14 @@ class LocalAPI:
         """Scope the indexing lane's connection overrides and the `usage`
         tally around one operation — runs inside whatever thread
         run_off_loop picked."""
-        from .utils import _llm_backend, _llm_usage
+        from .utils import _llm_backend, _llm_usage, _summary_language
         token = _llm_backend.set(self._index_backend)
         usage_token = _llm_usage.set(usage)
+        language_token = _summary_language.set(self._summary_language)
         try:
             return func(*args)
         finally:
+            _summary_language.reset(language_token)
             _llm_usage.reset(usage_token)
             _llm_backend.reset(token)
 

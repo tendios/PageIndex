@@ -32,7 +32,7 @@
 Este fork parte de [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) `v0.5.0` y se publica con etiquetas `v<upstream>-tendios.<n>` (versión del paquete `<upstream>+tendios.<n>`); fija una etiqueta, nunca `main`:
 
 ```bash
-pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.7"
+pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.8"
 ```
 
 ### Diferencias con upstream
@@ -52,7 +52,7 @@ Las extensiones de indexado se activan en modo local; el modo cloud conserva su 
 Instalación de la versión del fork con LiteParse:
 
 ```bash
-pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.7"
+pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.8"
 ```
 
 Para desarrollar desde este checkout:
@@ -120,6 +120,12 @@ partir de 0,60 de probabilidad y solo quita uno a partir de 0,85; si falla una p
 indexado no se interrumpe. En diez pliegos e informes reales (440 páginas) las reglas solas recuperan el 98 % de los
 títulos numerados; el modo flash con optimizador, el 51 %. `get_tree()` devuelve en `features.pdf_extraction.headings`
 el recuento de candidatos, los decididos por reglas y por el juez, y `structure_backend: "headings"`.
+
+### Idioma de los resúmenes
+
+Los resúmenes de cada nodo y la descripción del documento se escriben en el idioma del propio texto (castellano,
+catalán…): los prompts lo piden expresamente, porque sin decirlo el modelo responde en inglés. `summary_language="Spanish"`
+en la configuración del índice fuerza un idioma concreto.
 
 ### Rebasar sobre upstream
 
