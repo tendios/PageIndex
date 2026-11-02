@@ -171,12 +171,21 @@ def _lines_of(pages: list[dict[str, Any]]) -> list[Candidate]:
                     continue
                 previous = _snippet(blocks[order - 1].get("text") if order else "", tail=True)
                 following = _snippet("\n".join(text.split("\n")[1:]) or (blocks[order + 1].get("text") if order + 1 < len(blocks) else ""))
-                page_numbered = any(int(n) == page_no for n in re.findall(r"\d+", clean)[:3])
+                page_numbered = _carries_page_number(clean, page_no, keyword)
                 out.append(Candidate(index=len(out), page=page_no, order=order * 1000 + sub, text=clean, md=md,
                                      heading_block=heading_block, marker=marker, numbered=numbered,
                                      keyword=keyword, sources={"liteparse"}, previous=previous, following=following,
                                      page_numbered=page_numbered, bold=bold, leaders=leaders))
     return out
+
+
+def _carries_page_number(text: str, page_no: int, keyword: Optional[str] = None) -> bool:
+    """A footer-looking line: one of its first numbers is within five of the physical page («3 Departament…»,
+    «Página 7 de 113»; printed numbers often start after a cover). A section number («3.», «1.2», «Cláusula 3») is
+    followed by a dot or a bracket, or comes after its word, and never counts."""
+    if keyword or re.match(r"^\d{1,4}(?:\.\d{1,3})*\s*[.\-–)]", text):
+        return False
+    return any(abs(int(n) - page_no) <= 5 for n in re.findall(r"\d+", text)[:3])
 
 
 def _snippet(text: Optional[str], limit: int = 120, tail: bool = False) -> str:
@@ -292,8 +301,10 @@ def collect(pages: list[dict[str, Any]], layout_structure: Optional[list[dict]] 
             match.sources.add("toc")
             continue
         marker, numbered, keyword = marker_of(title)
-        kept.append(Candidate(index=-1, page=page_no, order=order, text=title, marker=marker, numbered=numbered,
-                              keyword=keyword, sources={"toc"}))
+        located = Candidate(index=-1, page=page_no, order=order, text=title, marker=marker, numbered=numbered,
+                            keyword=keyword, sources={"toc"}, page_numbered=_carries_page_number(title, page_no, keyword))
+        if noise(located, repeated) is None:
+            kept.append(located)
     for node in _flatten(layout_structure or []):
         title = node["title"]
         if title.lower().startswith(("page ", "preface")) or title.endswith("(intro)") or len(title) > MAX_TEXT:
@@ -303,8 +314,12 @@ def collect(pages: list[dict[str, Any]], layout_structure: Optional[list[dict]] 
             match.sources.add("layout")
             continue
         marker, numbered, keyword = marker_of(title)
-        kept.append(Candidate(index=-1, page=node["page"], order=_order_in_page(pages, node["page"], title), text=title,
-                              md=node["depth"], marker=marker, numbered=numbered, keyword=keyword, sources={"layout"}))
+        detected = Candidate(index=-1, page=node["page"], order=_order_in_page(pages, node["page"], title), text=title,
+                             md=node["depth"], marker=marker, numbered=numbered, keyword=keyword, sources={"layout"},
+                             page_numbered=_carries_page_number(title, node["page"], keyword))
+        # A footer or a table row the layout took for a title is no better a heading for coming from there.
+        if noise(detected, repeated) is None:
+            kept.append(detected)
     kept.sort(key=lambda c: (c.page, c.order))
     seen_markers: dict[str, int] = {}
     for i, c in enumerate(kept):
