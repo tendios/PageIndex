@@ -416,8 +416,9 @@ class LocalAPI:
         # "images": True sends each doubtful line with a crop of its page (size, weight, indent, position).
         return TypesafeHeadingJudge(api_key=api_key, model=conf.get("model") or TYPESAFE_MODEL,
                                     base_url=conf.get("base_url") or TYPESAFE_URL,
-                                    timeout=float(conf.get("timeout") or 90), workers=int(conf.get("workers") or 4),
-                                    pdf_path=pdf_path, pages=pages, images=bool(conf.get("images")))
+                                    timeout=float(conf.get("timeout") or 90), workers=int(conf.get("workers") or 8),
+                                    pdf_path=pdf_path, pages=pages, images=bool(conf.get("images")),
+                                    verify=bool(conf.get("verify", True)))
 
     def _index_headings(self, file_path: str, extraction, page_texts: list[str],
                         doc_name: str) -> tuple[list, str | None]:

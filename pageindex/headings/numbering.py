@@ -89,8 +89,8 @@ _KEYWORD = re.compile(
     r"(?:primer[ao]?|segund[ao]|segona|tercer[ao]?|cuart[ao]|quarta|quint[ao]|cinquena|sext[ao]|sisena|s[eé]ptim[ao]|"
     r"setena|octav[ao]|vuitena|noven[ao]|d[eé]cim[ao]|desena|[uú]nic[ao]?)(?=[\s.:,–-]))?(?P<rest>.*)$", re.I)
 _DECIMAL = re.compile(r"^(?P<num>\d{1,2}(?:\.\d{1,2}){0,5})(?:\.?(?P<letter>[A-Z])(?![A-Za-z]))?(?P<sep>\s*[.\-–)º°]*)\s*(?P<rest>.*)$")
-_LETTER = re.compile(r"^(?P<num>[A-Z](?:\.?\d{1,2}){0,2})(?P<sep>\s*[.\-–)]+|\s+(?=[A-ZÀ-Ú]{2}))\s*(?P<rest>.*)$")
-_ROMAN = re.compile(r"^(?P<num>[IVXLC]{1,6})(?P<sep>\s*[.\-–)]+|\s+(?=[A-ZÀ-Ú]))\s*(?P<rest>.*)$")
+_LETTER = re.compile(r"^(?P<num>[A-Z](?:\.?\d{1,2}){0,2})(?P<sep>\s*[.\-–)]+|(?<=\d)\s+(?=[A-ZÀ-Ú]{2}))\s*(?P<rest>.*)$")
+_ROMAN = re.compile(r"^(?P<num>[IVXLC]{1,6})(?P<sep>\s*[.\-–)]+)\s*(?P<rest>.*)$")
 
 
 # Ranks of the keywords that group a document, from the widest: «Libro» over «Título» over «Capítulo» over «Sección».

@@ -34,7 +34,8 @@ _INLINE = re.compile(
     r"(?<=[.:;)»”\]])\s+(?=(?:\d{1,2}(?:\.\d{1,2}){1,5}(?:\.\s*|\s+)[A-ZÀ-ÚÑÇL]|\d{1,2}\.\s+[A-ZÀ-ÚÑÇ]{2}|"
     r"[A-Z]\.?\d{1,2}\.?\s+[A-ZÀ-ÚÑÇ]|" + _ORDINAL_WORDS + r"\s*[.:]\s+[A-ZÀ-ÚÑÇ]))"
     # or straight after a title with no stop: «…DEL CONTRACTE Dinovena. Condicions…», «…contractista 26.1 L'import…»
-    r"|\s+(?=(?:" + _ORDINAL_WORDS + r"\s*\.\s+[A-ZÀ-ÚÑÇ]|\d{1,2}(?:\.\d{1,2}){1,5}\.?\s+[A-ZÀ-ÚÑÇ][a-zà-ÿ'’]))")
+    r"|\s+(?=(?:" + _ORDINAL_WORDS + r"\s*\.\s+[A-ZÀ-ÚÑÇ]|\d{1,2}(?:\.\d{1,2}){1,5}\.?\s+[A-ZÀ-ÚÑÇ][a-zà-ÿ'’]|"
+    r"(?:Cl[aàá]usula|CL[AÀÁ]USULA|Art[ií]culo|Article)\s+\d{1,3}\s*[.:\-–]\s*[A-ZÀ-ÚÑÇ]))")
 _BOLD_MARKS = re.compile(r"(\*{1,3}|_{2,3})(?=\S)|(?<=\S)(\*{1,3}|_{2,3})")
 
 
@@ -88,11 +89,11 @@ def _body_size(pages: list[dict[str, Any]]) -> Optional[float]:
 
 def _candidate(out: list[Candidate], page_no: int, order: int, text: str, *, md: int = 0, heading_block: bool = False,
                bold: bool = False, size: Optional[float] = None, source: str = "liteparse", inline: bool = False,
-               previous: str = "", following: str = "", block: Optional[dict] = None) -> None:
+               previous: str = "", following: str = "", block: Optional[dict] = None, bare: bool = False) -> None:
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return
-    mark = parse(text, bare=source == "table" or heading_block)
+    mark = parse(text, bare=bare or source == "table" or heading_block)
     family = mark.family if mark else None
     out.append(Candidate(index=len(out), page=page_no, order=order, text=text[:400], md=md, heading_block=heading_block,
                          marker=mark.raw if mark else None, numbered=mark is not None,
@@ -102,6 +103,17 @@ def _candidate(out: list[Candidate], page_no: int, order: int, text: str, *, md:
                          leaders=bool(_LEADER_END.search(text)) or bool(_LEADERS.search(text) and re.search(r"\d\s*$", text)),
                          mark=mark, size=size, inline=inline, block_id=(block or {}).get("block_id"),
                          bbox=(block or {}).get("bbox")))
+
+
+def _title_like(text: str) -> bool:
+    """A line of a spatial page that could be an unnumbered title: short, starting with a capital, not ending a
+    clause with a comma, and either in capitals or a few words."""
+    text = text.strip()
+    if not text or len(text) > 100 or not (text[0].isupper() or text[0] in "«\"'¿¡") or text.endswith((",", ";")):
+        return False
+    letters = [ch for ch in text if ch.isalpha()]
+    caps = bool(letters) and sum(ch.isupper() for ch in letters) / len(letters) > 0.6
+    return caps or (len(text.split()) <= 12 and not re.search(r"[a-zà-ÿ][.;:]\s+[a-zà-ÿ]", text))
 
 
 def _sequenced(rows: list[Candidate]) -> bool:
@@ -181,17 +193,65 @@ def lines_of(pages: list[dict[str, Any]]) -> list[Candidate]:
                         split = _split_inline(line_text)
                         pieces.extend((split if opens else split[1:]))
                         prev_line = line_text
+                spatial_row = False
                 for n, piece in enumerate(pieces):
                     heading_block = n == 0 and (kind == "heading" or md > 0)
                     if n == 0 and not heading_block and not parse(piece) and not (bold or font_bold) and kind != "page":
                         continue
+                    spatial_row = kind == "page" and bool(re.match(r"^\s*\d{1,2}\s+[A-ZÀ-ÚÑÇ]{3}", line))
+                    if kind == "page" and not parse(piece, bare=spatial_row) and not _title_like(piece):
+                        continue  # a wrapped line of running text on a spatial page: never a title, never asked
                     if n > 0 and not parse(piece):
                         continue
                     _candidate(out, page_no, k * 1000 + sub * 10 + n, piece, md=md if n == 0 else 0,
                                heading_block=heading_block, bold=(bold or font_bold) and n == 0, size=size if n == 0 else None,
                                inline=n > 0, previous=previous if n == 0 else _snippet(pieces[n - 1], tail=True),
-                               following=_snippet(pieces[n + 1] if n + 1 < len(pieces) else following_block), block=block)
+                               following=_snippet(pieces[n + 1] if n + 1 < len(pieces) else following_block), block=block,
+                               bare=kind == "page" and spatial_row)
+    _merge_tagged(out, pages)
+    _merge_inspector(out, pages)
     return out
+
+
+def _merge_inspector(out: list[Candidate], pages: list[dict[str, Any]]) -> None:
+    """pdf-inspector's headings: a second opinion on the lines it names (source «inspector»). Alone it decides
+    nothing."""
+    for page in pages:
+        page_no = int(page.get("page_index") or 0)
+        on_page = [c for c in out if c.page == page_no]
+        for k, head in enumerate(page.get("inspector_headings") or []):
+            text = head["text"]
+            match = max(((similar(c.text, text), c) for c in on_page), key=lambda x: x[0], default=(0.0, None))
+            if match[1] is not None and match[0] >= 0.8:
+                match[1].sources.add("inspector")
+                continue
+            # a heading no line carries is not added: on its own, pdf-inspector names form labels too
+
+
+def _merge_tagged(out: list[Candidate], pages: list[dict[str, Any]]) -> None:
+    """The headings a tagged PDF declares (its H1-H6): the line they name gets the tag, and one with no line of its
+    own (a title LiteParse merged into a block) is added."""
+    heads = [h["text"] for page in pages for h in page.get("tagged_headings") or []]
+    if not heads:
+        return
+    shaped = sum(1 for t in heads if len(t) <= 110 and (t[:1].isupper() or t[:1].isdigit())
+                 and not t.rstrip().endswith((".", ",", ";")) and not t.lstrip().startswith(("•", "-")))
+    if shaped < 0.85 * len(heads):
+        return  # the tags of this PDF mark body text as headings too: they tell nothing
+    for page in pages:
+        page_no = int(page.get("page_index") or 0)
+        on_page = [c for c in out if c.page == page_no]
+        for k, head in enumerate(page.get("tagged_headings") or []):
+            text, level = head["text"], int(head.get("level") or 1)
+            match = max(((similar(c.text, text), c) for c in on_page), key=lambda x: x[0], default=(0.0, None))
+            if match[1] is not None and match[0] >= 0.8:
+                c = match[1]
+                c.sources.add("tagged")
+                c.heading_block = True
+                c.md = c.md or level
+                continue
+            _candidate(out, page_no, _order_in_page(pages, page_no, text) if page_no <= len(pages) else k, text,
+                       md=level, heading_block=True, source="tagged", bare=True)
 
 
 def _noise(c: Candidate, repeated: set[str]) -> Optional[str]:
@@ -248,7 +308,7 @@ def strong(c: Candidate, body: Optional[float]) -> bool:
     caps = bool(letters) and sum(ch.isupper() for ch in letters) / len(letters) > 0.7 and len(title.split()) <= 16
     larger = bool(c.size and body and c.size >= body + 0.9)
     short = len(c.text) <= 120 and not c.text.rstrip().endswith((":", ";", ","))
-    return bool(c.heading_block or "layout" in c.sources or "toc" in c.sources or larger
+    return bool(c.heading_block or "layout" in c.sources or "toc" in c.sources or "tagged" in c.sources or larger
                 or ((c.bold or caps) and short))
 
 
@@ -262,7 +322,13 @@ def _history(state: dict, family: str) -> list:
 def _continues(state: dict[str, list], m: Marker) -> bool:
     """Continues the most recent position of its family, or one of the earlier ones: a list taken for sections
     («1.», «2.» inside a clause) must not hide that «9.» follows «8.4»."""
-    return any(follows(prev, m.path) for prev in reversed(_history(state, m.family)[-HISTORY:]))
+    history = _history(state, m.family)[-HISTORY:]
+    if not history:
+        return False
+    latest = history[-1]
+    # an earlier position only counts when the numbering moves forward: «9.» after a stray list «1., 2., 3.» that
+    # followed «8.4», never «2.» after the sequence has reached «3».
+    return any(follows(prev, m.path) and (prev == latest or m.path > latest) for prev in reversed(history))
 
 
 def _gap(state: dict[str, list], m: Marker) -> bool:
@@ -312,7 +378,7 @@ def decide(cands: list[Candidate], body: Optional[float]) -> None:
         m = _as_letter(state, c.mark) or c.mark
         c.mark = m
         looks = strong(c, body)
-        flagged = c.heading_block or "layout" in c.sources or "toc" in c.sources
+        flagged = c.heading_block or "layout" in c.sources or "toc" in c.sources or "tagged" in c.sources
         if m.family in ("annex", "chapter") and not m.path:  # «ANEXOS», «CAPÍTULO» without a number
             c.seq = "start"
             c.decision, c.reason = ("heading", "spine") if looks else (None, "")
@@ -320,7 +386,8 @@ def decide(cands: list[Candidate], body: Optional[float]) -> None:
         history = _history(state, m.family)
         if _continues(state, m):
             c.seq = "continue"
-        elif not history and (first_of_sequence(m.path) or m.family in CLAUSE_FAMILIES + TOP_FAMILIES):
+        elif not history and (first_of_sequence(m.path) or m.family in CLAUSE_FAMILIES + TOP_FAMILIES
+                              or (c.sources == {"table"} and len(m.path) == 1)):
             c.seq = "start"
         elif first_of_sequence(m.path) or m.family == "annex":
             c.seq = "restart"
@@ -340,13 +407,18 @@ def decide(cands: list[Candidate], body: Optional[float]) -> None:
         if c.seq == "continue":
             accept = True if not (c.inline and len(m.rest) < 3) else None
         elif c.seq == "start":
-            if flagged or _confirmed(cands, i, m, body, need_strong=False):
+            after_reset = state.get("_reset") and m.family in ("decimal", "paren")
+            if m.family in ("decimal", "paren") and len(m.path) == 1 and _sentence(c):
+                accept = False  # a sequence never starts with a sentence: that is a list
+            elif flagged or (_confirmed(cands, i, m, body, need_strong=False) and (not after_reset or _title_shaped(c))):
                 accept = True
             else:
                 accept = None if looks else False
         elif c.seq == "restart":
             if m.family == "annex":
                 accept = True if looks else None
+            elif m.family in ("decimal", "paren") and len(m.path) == 1 and _sentence(c):
+                accept = False
             elif flagged and _confirmed(cands, i, m, body, need_strong=True):
                 accept = True
             else:
@@ -371,6 +443,18 @@ def _since(state: dict[str, list], scope: tuple, m: Marker) -> bool:
     return m.path[0] != clause_value or len(m.path) == 1 and state.get("_clause_restarted")
 
 
+def _sentence(c: Candidate) -> bool:
+    """«1. Que consto/l'empresa consta inscrita…», «2. La proposició presentada per les empreses…»: the text of the
+    line reads as a sentence (a declaration, a requirement), whatever its format says."""
+    rest = (c.mark.rest if c.mark else c.text).strip(" *_")
+    if re.match(r"(?i)^(que|qu[eè]|si|en el cas|en caso|cuando|quan|perqu[eè]|porque)\b", rest):
+        return True
+    head = re.split(r"(?<=[a-zà-ÿ]{3})[.:](?=\s|$)", rest, maxsplit=1)[0]
+    return len(head) > 90 or bool(re.search(
+        r"\b(?:és|es|son|són|serà|será|seran|serán|haurà|deberá|podrà|podrá|presentada|presentades|consta|disposa|"
+        r"declara|declaro|assumeix|asume|té|tiene)\b", head, re.I))
+
+
 def _title_shaped(c: Candidate) -> bool:
     """«1. Objecte del contracte», «2. **Règim jurídic** El contracte…»: a short title or a bold one ahead of the
     text; not «1. Aquest contracte té per objecte el subministrament…»."""
@@ -391,9 +475,10 @@ def _advance(state: dict[str, list], m: Marker, seq: str) -> None:
     elif m.family == "decimal" and len(m.path) == 1 and state.get("_clause") and m.path[0] == 1:
         state["_clause_restarted"] = True
     if m.family in ("annex", "chapter"):
+        state["_reset"] = m.family == "annex"
         # a new annex or chapter: the numbering below begins again (a roman list inside a section does not)
         for family in list(state):
-            if family.startswith("_"):
+            if family.startswith("_") and family != "_reset":
                 state[family] = None
             elif family not in TOP_FAMILIES:
                 state[family] = []
@@ -489,6 +574,15 @@ def collect(pages: list[dict[str, Any]], layout_structure: Optional[list[dict]] 
     lines = lines_of(pages)
     repeated = repeated_texts(lines)
     toc_pages = index_pages(lines, repeated, len(pages))
+    # an index repeats the titles it lists: what repeats is decided without its pages (and one line per page)
+    seen_lines: set = set()
+    body_lines = []
+    for c in lines:
+        key = (c.page, norm(c.text))
+        if c.page not in toc_pages and key not in seen_lines:
+            seen_lines.add(key)
+            body_lines.append(c)
+    repeated = repeated_texts(body_lines)
     body = _body_size(pages)
     kept: list[Candidate] = []
     dropped: Counter = Counter()
@@ -516,13 +610,28 @@ def collect(pages: list[dict[str, Any]], layout_structure: Optional[list[dict]] 
     kept.sort(key=lambda c: (c.page, c.order))
     for i, c in enumerate(kept):
         c.index = i
+    _drop_index_copies(kept, len(pages))
     decide(kept, body)
+    recovered = recover_gaps(kept, pages)
+    if recovered:
+        kept.sort(key=lambda c: (c.page, c.order))
+        for i, c in enumerate(kept):
+            c.index = i
     # The cover: unnumbered lines of the first page before the first numbered section are the document's title.
     first = next((c for c in kept if c.decision == "heading" and c.mark is not None), None)
     if first is not None and first.page > 1:
         for c in kept:
             if c.page == 1 and c.decision is None and c.mark is None and "toc" not in c.sources:
                 c.decision, c.reason = "body", "cover"
+    # Containers: an unnumbered heading the reader flagged that opens a sequence right below it («CUADRO DE
+    # CARACTERÍSTICAS DEL CONTRATO» before its «1.»).
+    for k, c in enumerate(kept):
+        if c.decision is not None or c.mark is not None or not (c.heading_block or c.bold):
+            continue
+        nxt = next((h for h in kept[k + 1:k + 4] if h.mark is not None), None)
+        if nxt is not None and nxt.decision == "heading" and nxt.seq in ("start", "restart") and nxt.page - c.page <= 1 \
+                and len(c.text) <= 90 and not c.text.rstrip().endswith((":", ",", ".")):
+            c.decision, c.reason = "heading", "container"
     seen: dict[str, int] = {}
     for c in kept:
         if c.decision == "heading" and c.marker:
@@ -535,6 +644,90 @@ def collect(pages: list[dict[str, Any]], layout_structure: Optional[list[dict]] 
     return kept, report, body
 
 
+def _drop_index_copies(cands: list[Candidate], total_pages: int) -> None:
+    """A numbered clause, chapter or annex that comes back later in the body was, in the first pages, an entry of the
+    document's index (one the leaders did not give away): content, never the section."""
+    horizon = max(3, int(total_pages * 0.12))
+    later: dict[tuple, int] = {}
+    for c in cands:
+        if c.mark and c.mark.family in ("clause", "ordinal") and c.mark.path:
+            later[(c.mark.family, c.mark.path)] = max(later.get((c.mark.family, c.mark.path), 0), c.page)
+    for c in cands:
+        if c.mark and c.page <= horizon and c.decision is None and c.mark.path \
+                and later.get((c.mark.family, c.mark.path), 0) > c.page + 1:
+            c.decision, c.reason, c.seq = "body", "index_copy", "index"
+
+
+def _marker_pattern(family: str, path: tuple, bare: bool) -> Optional[str]:
+    """How the missing number would be written at the start of a line: «8.4», «8.4.», «B.2», «B2», «3 OBJETO»."""
+    if family == "decimal":
+        num = r"\.".join(str(x) for x in path)
+        sep = r"(?:\.?\s*[-–)]?\s*|\s+)" if len(path) > 1 or not bare else r"(?:\s*[.\-–)]\s*|\s+(?=[A-ZÀ-ÚÑÇ]{2}))"
+        return rf"(?<![\d.,]){num}{sep}(?=[A-ZÀ-ÚÑÇa-zà-ÿ¿«\"'])"
+    if family == "letter":
+        head = chr(ord("A") + path[0] - 1)
+        tail = "".join(rf"\.?{x}" for x in path[1:])
+        return rf"(?<![A-Za-z\d]){head}{tail}\s*[.\-–)]\s*(?=[A-ZÀ-ÚÑÇ])"
+    return None
+
+
+def recover_gaps(cands: list[Candidate], pages: list[dict[str, Any]]) -> list[Candidate]:
+    """The numbers a sequence skips: between «8.3» and «8.5» there is an «8.4», between rows «2» and «4» a «3».
+    Each one is looked for at the start of a line or after a full stop in the text between its two neighbours, and
+    added as a heading when it is found once."""
+    accepted = [c for c in cands if c.decision == "heading" and c.mark and c.mark.family in ("decimal", "letter")]
+    added: list[Candidate] = []
+    texts = {int(p.get("page_index") or 0): p.get("markdown") or "" for p in pages}
+    by_family: dict[str, list[Candidate]] = {}
+    for c in accepted:
+        by_family.setdefault(c.mark.family, []).append(c)
+    for family, seq in by_family.items():
+        first = seq[0]
+        if len(first.mark.path) == 1 and 2 <= first.mark.path[0] <= 4:
+            # the sequence's first rows, lost before it started: look back up to two pages
+            phantom = Candidate(index=-1, page=max(1, first.page - 2), order=-1, text="", mark=Marker(
+                family, (0,), "", ""), sources=set())
+            seq = [phantom] + seq
+        for a, b in zip(seq, seq[1:]):
+            pa, pb = a.mark.path, b.mark.path
+            missing: list[tuple] = []
+            if pa == (0,):
+                missing = [(v,) for v in range(1, pb[0])]
+            elif len(pa) == len(pb) and pa[:-1] == pb[:-1] and 1 < pb[-1] - pa[-1] <= 1 + GAP_MAX:
+                missing = [(*pa[:-1], v) for v in range(pa[-1] + 1, pb[-1])]
+            elif len(pb) == len(pa) + 1 and pb[:-1] == pa and 1 < pb[-1] <= 1 + GAP_MAX:
+                missing = [(*pa, v) for v in range(1, pb[-1])]
+            if not missing or b.page - a.page > 3:
+                continue
+            bare = a.sources == {"table"} or b.sources == {"table"} or (len(pb) == 1 and not b.mark.raw.endswith("."))
+            for path in missing:
+                pattern = _marker_pattern(family, path, bare)
+                if not pattern:
+                    continue
+                hits = []
+                for page_no in range(a.page, b.page + 1):
+                    text = texts.get(page_no, "")
+                    start = text.find(a.text[:30]) + len(a.text[:30]) if a.text and page_no == a.page and a.text[:30] in text else 0
+                    end = text.find(b.text[:30]) if page_no == b.page and b.text[:30] in text else len(text)
+                    for m in re.finditer(r"(?:^|\n|(?<=[.:;|])\s+|\|\s*)(?:[#*_\s]*)(" + pattern + ")", text[start:end]):
+                        line = text[start + m.start(1):start + m.start(1) + 160].split("\n")[0]
+                        hits.append((page_no, re.sub(r"[*_|#]+", " ", line).strip()))
+                if len(hits) != 1:
+                    continue
+                page_no, line = hits[0]
+                line = re.sub(r"\s+", " ", line)
+                mark = parse(line, bare=True)
+                if not mark or mark.path != path:
+                    continue
+                order = (a.order + 1) if page_no == a.page else (b.order - 1 if page_no == b.page else 0)
+                c = Candidate(index=-1, page=page_no, order=order, text=line[:400], marker=mark.raw, numbered=True,
+                              sources={"gap"}, mark=mark, seq="recovered", decision="heading", reason="spine:recovered",
+                              known=True)
+                cands.append(c)
+                added.append(c)
+    return added
+
+
 def decide_unsettled(c: Candidate, body: Optional[float], numbered: bool = False) -> str:
     """Without a judge, the lines the spine left open: a heading when it looks like one, else content. In a
     numbered document an unnumbered line needs the index, or the layout and the reader's flag together."""
@@ -542,11 +735,12 @@ def decide_unsettled(c: Candidate, body: Optional[float], numbered: bool = False
         if c.seq == "clause_item":
             return "heading" if (c.heading_block or "layout" in c.sources or "toc" in c.sources) else "body"
         return "heading" if strong(c, body) and c.seq in ("start", "gap", "restart") else "body"
-    if "toc" in c.sources and len(c.text) <= MAX_TEXT:
-        return "heading"
+    if ("toc" in c.sources or "tagged" in c.sources) and len(c.text) <= MAX_TEXT:
+        return "heading"  # the document's index or its own heading tags name it
+    shaped = len(c.text) <= 100 and not c.text.rstrip().endswith((":", ",", ".", ";"))
     if numbered:
-        return "heading" if ("layout" in c.sources and (c.heading_block or c.bold) and c.md <= 2
-                             and len(c.text) <= 100 and not c.text.rstrip().endswith((":", ",", "."))) else "body"
+        votes = sum(("layout" in c.sources, "inspector" in c.sources, c.heading_block and c.md <= 3, c.bold))
+        return "heading" if shaped and votes >= 2 and ("layout" in c.sources or "inspector" in c.sources) else "body"
     if "layout" in c.sources and len(c.text) <= MAX_TEXT:
         return "heading"
     if c.heading_block and c.md <= 3 and 8 <= len(c.text) <= MAX_TEXT and len(c.text.split()) >= 2 \
