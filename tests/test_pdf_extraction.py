@@ -153,7 +153,7 @@ def test_liteparse_flows_to_flash_store_tools_and_citations(sample_pdf, tmp_path
     monkeypatch.setattr(flash, "page_index_flash", index)
     monkeypatch.setattr(utils, "generate_doc_description", lambda *a, **k: "test")
     client = PageIndexClient(index={"model": "m", "pdf_parser": "liteparse", "storage_path": str(tmp_path / "store")})
-    doc = client.submit_document(sample_pdf)["doc_id"]
+    doc = client.submit_document(sample_pdf, mode="flash")["doc_id"]
     assert seen["page_texts"] == ["recovered1", "recovered2"]
     assert "recovered2" in str(client.get_tree(doc))
     assert client.get_ocr(doc)["features"]["pdf_extraction"]["parser"] == "liteparse"

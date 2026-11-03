@@ -213,7 +213,8 @@ def test_client_indexes_in_headings_mode_with_the_flash_summaries(tmp_path, samp
 
     client = PageIndexClient(index={"mode": "local", "model": "openai/gpt-test", "storage_path": str(tmp_path / "store"),
                                     "pdf_parser": "liteparse"})
-    result = client.submit_document(sample_pdf, mode="headings", doc_id="pcap")
+    # No mode named: with LiteParse, headings is the default.
+    result = client.submit_document(sample_pdf, doc_id="pcap")
     tree = client.get_tree("pcap", node_summary=True, include_text=False)["result"]
     assert [n["title"] for n in tree] == ["1. OBJECTE DEL CONTRACTE", "2. PRESSUPOST"]
     assert tree[0]["summary"] == "resumen de 1. OBJECTE DEL CONTRACTE" and tree[0]["node_id"] == "0000"
@@ -231,9 +232,52 @@ def test_headings_mode_needs_liteparse_and_a_known_judge(tmp_path, sample_pdf, m
     client = PageIndexClient(storage_path=str(tmp_path / "store"))
     with pytest.raises(PageIndexAPIError, match="pdf_parser='liteparse'"):
         client.submit_document(sample_pdf, mode="headings")
-    with pytest.raises(PageIndexAPIError, match="heading_judge"):
+    with pytest.raises(PageIndexAPIError, match='"auto", "typesafe", "none"'):
         PageIndexClient(index={"mode": "local", "model": "openai/x", "storage_path": str(tmp_path / "s2"),
-                               "pdf_parser": "liteparse", "heading_judge": "oracle"})._api._heading_judge_instance()
+                               "pdf_parser": "liteparse", "heading_judge": "oracle"})
     with pytest.raises(PageIndexAPIError, match="TYPESAFE_AI_API_KEY"):
         PageIndexClient(index={"mode": "local", "model": "openai/x", "storage_path": str(tmp_path / "s3"),
                                "pdf_parser": "liteparse", "heading_judge": "typesafe"})._api._heading_judge_instance()
+
+
+def test_headings_is_the_default_mode_with_liteparse_and_flash_otherwise(tmp_path, sample_pdf):
+    from pageindex.local_api import LocalAPI
+    assert LocalAPI(str(tmp_path), "m", "m", pdf_parser="liteparse").default_mode == "headings"
+    assert LocalAPI(str(tmp_path), "m", "m").default_mode == "flash"
+    assert LocalAPI(str(tmp_path), "m", "m", pdf_parser="default").default_mode == "flash"
+    with pytest.raises(PageIndexAPIError, match="'headings' \\(the default with pdf_parser='liteparse'\\)"):
+        PageIndexClient(storage_path=str(tmp_path / "store")).submit_document(sample_pdf, mode="outline")
+
+
+def test_the_judge_defaults_to_jev_when_the_typesafe_key_is_set_and_to_the_rules_otherwise(tmp_path, monkeypatch):
+    from pageindex.local_api import LocalAPI
+    monkeypatch.delenv("TYPESAFE_AI_API_KEY", raising=False)
+    for judge in (None, "", "auto", "none"):
+        assert LocalAPI(str(tmp_path), "m", "m", pdf_parser="liteparse", heading_judge=judge)._heading_judge_instance() is None
+    keyed = LocalAPI(str(tmp_path), "m", "m", pdf_parser="liteparse",
+                     heading_judge={"name": "auto", "api_key": "own-key"})._heading_judge_instance()
+    assert isinstance(keyed, TypesafeHeadingJudge) and keyed._api_key == "own-key"
+    monkeypatch.setenv("TYPESAFE_AI_API_KEY", "env-key")
+    for judge in (None, "auto", "typesafe"):
+        instance = LocalAPI(str(tmp_path), "m", "m", pdf_parser="liteparse", heading_judge=judge)._heading_judge_instance()
+        assert isinstance(instance, TypesafeHeadingJudge) and instance._api_key == "env-key" and instance.model == "jev-latest"
+    assert LocalAPI(str(tmp_path), "m", "m", pdf_parser="liteparse", heading_judge="none")._heading_judge_instance() is None
+    # A dict keeps its options whichever name chose Jev; its own key wins over the environment's.
+    tuned = LocalAPI(str(tmp_path), "m", "m", pdf_parser="liteparse",
+                     heading_judge={"name": "auto", "model": "jev-2", "workers": 2})._heading_judge_instance()
+    assert tuned.model == "jev-2" and tuned.workers == 2 and tuned._api_key == "env-key"
+    own = LocalAPI(str(tmp_path), "m", "m", pdf_parser="liteparse",
+                   heading_judge={"name": "typesafe", "api_key": "own-key"})._heading_judge_instance()
+    assert own._api_key == "own-key"
+    # The client validates the names up front, "auto" included.
+    client = PageIndexClient(index={"mode": "local", "model": "openai/x", "storage_path": str(tmp_path / "s"),
+                                    "pdf_parser": "liteparse", "heading_judge": "auto"})
+    assert isinstance(client._api._heading_judge_instance(), TypesafeHeadingJudge)
+
+
+def test_the_local_client_forwards_the_judge_and_the_summary_language(tmp_path):
+    from pageindex import PageIndexLocalClient
+    client = PageIndexLocalClient(model="openai/x", storage_path=str(tmp_path / "s"), pdf_parser="liteparse",
+                                  heading_judge="none", summary_language="Spanish")
+    assert client._api._heading_judge == "none" and client._api._summary_language == "Spanish"
+    assert client._api.default_mode == "headings"

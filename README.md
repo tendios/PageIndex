@@ -32,7 +32,7 @@
 Este fork parte de [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) `v0.5.0` y se publica con etiquetas `v<upstream>-tendios.<n>` (versión del paquete `<upstream>+tendios.<n>`); fija una etiqueta, nunca `main`:
 
 ```bash
-pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.8"
+pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.9"
 ```
 
 ### Diferencias con upstream
@@ -45,13 +45,14 @@ Las extensiones de indexado se activan en modo local; el modo cloud conserva su 
 - **`if_exists="replace"`**: con `doc_id`, reindexa y sustituye el documento bajo el mismo id.
 - **Vista de biblioteca**: con `doc_id` como lista, el primer mensaje del chat lleva, por documento, nombre, metadatos, descripción y árbol (sin texto), recortado a niveles 1-2 por encima de `client.library_view_max_tokens` (12 000). La herramienta `get_library_structure(doc_names)` devuelve lo mismo en una llamada. `client.library_view = False` vuelve al comportamiento de upstream. Opcional: `client.build_library_topics()` construye un índice de temas con el modelo de indexado y `client.library_topics = True` lo muestra.
 - **LiteParse opcional**: OCR por página con `pdf-inspector`, contenido compartido por el índice y el chat, bloques y cajas de palabras persistidos. Ver la configuración siguiente.
+- **Modo `headings`**, el modo por defecto con LiteParse: el árbol sale de los encabezados del propio documento (los bloques de LiteParse, su numeración, sus páginas de índice y los títulos de la maquetación) y Jev, de Typesafe, decide las líneas dudosas cuando hay `TYPESAFE_AI_API_KEY`. Sin optimizador. Ver [Modo `headings`](#modo-headings-el-árbol-desde-los-encabezados-del-documento).
 
 ### LiteParse, OCR y citas con coordenadas
 
 Instalación de la versión del fork con LiteParse:
 
 ```bash
-pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.8"
+pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.5.0-tendios.9"
 ```
 
 Para desarrollar desde este checkout:
@@ -98,25 +99,27 @@ La librería aporta extracción y geometría genéricas. La recuperación de evi
 
 ### Modo `headings`: el árbol desde los encabezados del documento
 
-`submit_document(path, mode="headings")` construye el árbol con los encabezados que LiteParse marca (`#`, `##`…), la
-numeración del propio documento («1.2», «Cláusula 3», «Annex 2»), las entradas de sus páginas de índice localizadas
-en el cuerpo y los títulos que detecta la maquetación de flash; descarta encabezados y pies repetidos, celdas de tabla
-e ítems de lista, y un juez decide las líneas que ninguna regla resuelve. Después siguen los resúmenes y la descripción
-de flash, sin optimizador: un apartado corto sigue siendo un apartado, porque así se pide el documento. Exige
-`pdf_parser="liteparse"`.
+Con `pdf_parser="liteparse"`, `submit_document(path)` indexa en modo `headings` salvo que se pida `flash` o
+`standard` (con el lector predeterminado el modo por defecto sigue siendo `flash`, como en upstream; `headings` exige
+LiteParse). El árbol se construye con los encabezados que LiteParse marca (`#`, `##`…), la numeración del propio
+documento («1.2», «Cláusula 3», «Annex 2»), las entradas de sus páginas de índice localizadas en el cuerpo y los
+títulos que detecta la maquetación de flash; descarta encabezados y pies repetidos, celdas de tabla e ítems de lista,
+y un juez decide las líneas que ninguna regla resuelve. Después siguen los resúmenes y la descripción de flash, sin
+optimizador: un apartado corto sigue siendo un apartado, porque así se pide el documento.
 
 ```python
 client = PageIndexClient(index={"mode": "local", "model": "anthropic/claude-haiku-5-5",
-                                "pdf_parser": "liteparse",
-                                "heading_judge": {"name": "typesafe", "api_key": "..."}})  # o "typesafe" (TYPESAFE_AI_API_KEY) o "none"
-client.submit_document("pcap.pdf", mode="headings")
+                                "pdf_parser": "liteparse"})  # heading_judge="auto": Jev si hay TYPESAFE_AI_API_KEY
+client.submit_document("pcap.pdf")                            # mode="headings" por defecto con LiteParse
 ```
 
 El juez (`heading_judge`) es Jev, de Typesafe, un clasificador determinista: recibe el esquema del documento (línea,
 página, número, nivel de encabezado del lector, si la maquetación la detectó, si repite número) y decide «abre un
 apartado» o «es contenido», por líneas o por grupos de hermanos numerados. Añade un título que las reglas no vieron a
 partir de 0,60 de probabilidad y solo quita uno a partir de 0,85; si falla una petición, las reglas deciden y el
-indexado no se interrumpe. En diez pliegos e informes reales (440 páginas) las reglas solas recuperan el 98 % de los
+indexado no se interrumpe. `heading_judge` admite `"auto"` (por defecto: Jev con la clave de `TYPESAFE_AI_API_KEY`,
+las reglas solas si no la hay), `"typesafe"` (exige la clave), `"none"` (las reglas solas) o un diccionario
+`{"name": "typesafe" | "auto", "api_key": ..., "model": ..., "base_url": ..., "timeout": ..., "workers": ...}`. En diez pliegos e informes reales (440 páginas) las reglas solas recuperan el 98 % de los
 títulos numerados; el modo flash con optimizador, el 51 %. `get_tree()` devuelve en `features.pdf_extraction.headings`
 el recuento de candidatos, los decididos por reglas y por el juez, y `structure_backend: "headings"`.
 
