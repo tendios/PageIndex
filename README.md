@@ -44,7 +44,6 @@ Las extensiones de indexado se activan en modo local; el modo cloud conserva su 
 - **`doc_id` externo**: `submit_document(..., doc_id="contrato-42")` indexa con ese id (1–128 caracteres `[A-Za-z0-9._-]`). Si ya existe, error 409.
 - **`if_exists="replace"`**: con `doc_id`, reindexa y sustituye el documento bajo el mismo id.
 - **Vista de biblioteca**: con `doc_id` como lista, el primer mensaje del chat lleva, por documento, nombre, metadatos, descripción y árbol (sin texto), recortado a niveles 1-2 por encima de `client.library_view_max_tokens` (12 000). La herramienta `get_library_structure(doc_names)` devuelve lo mismo en una llamada. `client.library_view = False` vuelve al comportamiento de upstream. Opcional: `client.build_library_topics()` construye un índice de temas con el modelo de indexado y `client.library_topics = True` lo muestra.
-- **Búsqueda conjunta por etapas, experimental y opcional**: `MultiDocumentSearch(client).query(...)` examina los árboles por lotes, lee páginas originales y valida citas literales antes de sintetizar. Limita contexto por llamada, llamadas y consumo; devuelve resultados parciales explícitos al agotar límites. No modifica `chat()`, ni se activa automáticamente por enviar varios documentos. Ver [API, selección de modo y benchmark](cookbook/multidoc/README.md).
 - **LiteParse opcional**: OCR por página con `pdf-inspector`, contenido compartido por el índice y el chat, bloques y cajas de palabras persistidos. Ver la configuración siguiente.
 
 ### LiteParse, OCR y citas con coordenadas
