@@ -31,9 +31,13 @@ def fake_parser(monkeypatch, results, routed=(2,)):
 
     class Parser:
         def __init__(self, **kwargs):
-            calls.append(kwargs)
+            self.tags = bool(kwargs.get("extract_structure_tree"))
+            if not self.tags:  # the light pass that reads a tagged PDF's headings is not an extraction pass
+                calls.append(kwargs)
 
         def parse(self, data):
+            if self.tags:
+                raise RuntimeError("untagged fixture")
             item = results.pop(0)
             if isinstance(item, Exception):
                 raise item

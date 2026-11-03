@@ -137,6 +137,70 @@ def _page_record(page: dict, conf: dict, routed: bool) -> dict:
                        **page}}
 
 
+def _inspector_headings(inspector, data: bytes, count: int) -> list[list[dict]]:
+    """The headings pdf-inspector's own reading finds from the typography (its markdown «#» lines), per page: an
+    opinion independent of LiteParse's, for the native pages. Unavailable or failing: []."""
+    import re as _re
+    try:
+        result = inspector.extract_pages_markdown_bytes(data)
+    except Exception:
+        return [[] for _ in range(count)]
+    out: dict[int, list[dict]] = {}
+    for page in getattr(result, "pages", None) or []:
+        heads = []
+        for line in (getattr(page, "markdown", "") or "").splitlines():
+            m = _re.match(r"^(#{1,6})\s+(.+)$", line.strip())
+            if m:
+                heads.append({"level": len(m.group(1)), "text": _re.sub(r"[*_]{2,}", "", m.group(2)).strip()[:300]})
+        out[int(getattr(page, "page", 0) or 0)] = heads
+    return [out.get(n, []) for n in range(1, count + 1)]
+
+
+def _tagged_headings(parser_class, data: bytes, count: int) -> list[list[dict]]:
+    """The headings a tagged PDF declares (H1-H6 in its structure tree, as Word exports its heading styles), per
+    page, with their level and text. A separate light pass: the text metadata that links tags to text changes how
+    text items are split, so the stored text and geometry stay those of the main pass. Untagged or unreadable: []."""
+    import re as _re
+    try:
+        result = asdict(parser_class(extract_structure_tree=True, extract_text_metadata=True, extract_blocks=False,
+                                     output_format="text", ocr_enabled=False, quiet=True,
+                                     continue_on_page_error=True).parse(data))
+    except Exception:
+        return [[] for _ in range(count)]
+    out: dict[int, list[dict]] = {}
+    for page in result.get("pages") or []:
+        heads: list[tuple[int, list]] = []
+
+        def walk(node: dict, inside: bool = False) -> None:
+            kind = node.get("type") or ""
+            level = int(kind[1]) if _re.fullmatch(r"H[1-6]", kind) else (1 if kind == "H" else 0)
+            if level and not inside:
+                ids: list = []
+
+                def collect(n: dict) -> None:
+                    ids.extend(n.get("marked_content_ids") or [])
+                    for child in n.get("children") or []:
+                        collect(child)
+                collect(node)
+                heads.append((level, ids))
+                return
+            for child in node.get("children") or []:
+                walk(child, inside)
+
+        for root in (page.get("structure_tree") or {}).get("roots") or []:
+            walk(root)
+        found = []
+        for level, ids in heads:
+            wanted = set(ids)
+            items = sorted((t for t in page.get("text_items") or [] if t.get("mcid") in wanted),
+                           key=lambda t: (round(t["y"]), t["x"]))
+            text = _re.sub(r"\s+", " ", " ".join(t.get("text") or "" for t in items)).strip()
+            if text:
+                found.append({"level": level, "text": text[:300]})
+        out[page.get("page_num")] = found
+    return [out.get(n, []) for n in range(1, count + 1)]
+
+
 def extract_liteparse(file_path: str, config: str | Mapping) -> PDFExtraction:
     conf = parser_config(config)
     try:
@@ -192,6 +256,12 @@ def extract_liteparse(file_path: str, config: str | Mapping) -> PDFExtraction:
             raise ValueError("LiteParse OCR pass did not return exactly the requested physical pages")
         by_page.update(replacement)
     pages = [_page_record(by_page[n], conf, n in routed) for n in range(1, count + 1)]
+    for record, heads in zip(pages, _tagged_headings(LiteParse, data, count)):
+        if heads and record["page_index"] not in routed:
+            record["tagged_headings"] = heads
+    for record, heads in zip(pages, _inspector_headings(pdf_inspector, data, count)):
+        if heads and record["page_index"] not in routed:
+            record["inspector_headings"] = heads
     return PDFExtraction(pages, {"parser": "liteparse", "version": version("liteparse"),
                                 "ocr_mode": mode, "ocr_language": conf["ocr_language"],
                                 "ocr_backend": "http" if conf.get("ocr_server_url") else "tesseract",

@@ -35,6 +35,32 @@ def _line_y(page: dict[str, Any], text: str) -> Optional[tuple[float, float]]:
     return None
 
 
+_rendered: "OrderedDict[tuple[str, int], Any]" = None  # type: ignore[assignment]
+CACHE_PAGES = 12
+
+
+def _page_image(pdf_path: str, page_no: int):
+    """The page rendered once and kept for its next lines (asked lines come in document order)."""
+    global _rendered
+    import pypdfium2 as pdfium
+    from collections import OrderedDict
+    with _lock:
+        if _rendered is None:
+            _rendered = OrderedDict()
+        key = (pdf_path, page_no)
+        if key in _rendered:
+            _rendered.move_to_end(key)
+            return _rendered[key]
+        doc = _docs.get(pdf_path)
+        if doc is None:
+            doc = _docs[pdf_path] = pdfium.PdfDocument(pdf_path)
+        image = doc[page_no - 1].render(scale=SCALE).to_pil().convert("RGB")
+        _rendered[key] = image
+        while len(_rendered) > CACHE_PAGES:
+            _rendered.popitem(last=False)
+        return image
+
+
 def line_crop(pdf_path: str, pages: list[dict[str, Any]], c: Any) -> Optional[bytes]:
     try:
         import pypdfium2 as pdfium
@@ -51,11 +77,7 @@ def line_crop(pdf_path: str, pages: list[dict[str, Any]], c: Any) -> Optional[by
         return None
     y, h = found
     top, bottom = max(0.0, y - 3.2 * h), min(height, y + 4.5 * h)
-    with _lock:
-        doc = _docs.get(pdf_path)
-        if doc is None:
-            doc = _docs[pdf_path] = pdfium.PdfDocument(pdf_path)
-        rendered = doc[c.page - 1].render(scale=SCALE).to_pil().convert("RGB")
+    rendered = _page_image(pdf_path, c.page)
     sx, sy = rendered.width / width, rendered.height / height
     crop = rendered.crop((0, int(top * sy), rendered.width, int(bottom * sy)))
     draw = ImageDraw.Draw(crop)

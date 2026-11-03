@@ -60,6 +60,35 @@ def build_headings_structure(pages: list[dict[str, Any]], page_texts: list[str],
         choice, probability = judged[c.index]
         c.decision, c.reason = _settle(rule, choice, probability)
     headings = [c for c in candidates if c.decision == "heading"]
+    if judge is not None and getattr(judge, "verify_pass", False) and headings:
+        accepted = {(c.mark.family, c.mark.path) for c in headings if c.mark is not None}
+
+        def in_run(c) -> bool:
+            """A first-level number with both neighbours accepted («3.-» between «2.-» and «4.-»): a whole sequence."""
+            m = c.mark
+            if m is None or len(m.path) != 1:
+                return False
+            before, after = (m.family, (m.path[0] - 1,)), (m.family, (m.path[0] + 1,))
+            return before in accepted and after in accepted
+
+        for c in headings:
+            m = c.mark
+            c._verify = not ("toc" in c.sources or "tagged" in c.sources or c.reason == "container"
+                             or (m is not None and m.family in ("chapter", "annex", "clause", "ordinal"))
+                             or (m is not None and len(m.path) >= 2 and c.seq in ("continue", "recovered"))
+                             or in_run(c))
+        try:
+            verdicts = judge.verify(document or {}, headings)
+        except Exception as exc:
+            logger.warning("headings verify unavailable: %s", exc)
+            verdicts = {}
+        removed = [c for c in headings if verdicts.get(c.index, ("", 0.0))[0] == "body"
+                   and verdicts[c.index][1] >= JUDGE_REMOVES_AT]
+        for c in removed:
+            c.decision, c.reason = "body", f"verify:{verdicts[c.index][1]:.2f}"
+        headings = [c for c in headings if c.decision == "heading"]
+        report["verified"] = sum(1 for c in candidates if getattr(c, "_verify", False))
+        report["verify_removed"] = len(removed)
     ranks(headings)
     structure = build(headings, len(page_texts))
     if structure:

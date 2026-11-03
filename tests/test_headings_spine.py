@@ -92,3 +92,37 @@ def test_a_page_a_giant_table_swallows_is_read_as_spatial_text():
                        "rows": [[{"text": "DOCUMENTS"}], [cell]]}]}
     record = _page_record(raw, parser_config("liteparse"), False)
     assert record["extraction"]["text_format"] == "spatial" and record["blocks"][0]["block_type"] == "page"
+
+
+def test_a_skipped_number_is_found_in_the_text_between_its_neighbours():
+    pages = [page(1, [("heading", "# 1. EJECUCIÓN"), ("paragraph", "1.1. Plazo de ejecución del servicio"),
+                      ("paragraph", "Texto del plazo. 1.2. Lugar de entrega de los bienes Texto del lugar."),
+                      ("paragraph", "1.3. Responsable del contrato")])]
+    pages[0]["markdown"] = ("# 1. EJECUCIÓN\n\n1.1. Plazo de ejecución del servicio\n\nTexto del plazo, sin más.\n"
+                            "1.2. Lugar de entrega de los bienes\n\n1.3. Responsable del contrato")
+    pages[0]["blocks"][2]["text"] = "Texto del plazo, sin más."
+    cands, _, _ = collect(pages)
+    recovered = [c for c in cands if c.reason == "spine:recovered"]
+    assert [c.mark.path for c in recovered] == [(1, 2)] and recovered[0].decision == "heading"
+
+
+def test_a_sequence_never_starts_with_a_sentence():
+    pages = [page(1, [("heading", "# ANNEX 2. DECLARACIÓ RESPONSABLE"),
+                      ("heading", "### 1. Que consto/l'empresa consta inscrita en el Registre Oficial de Licitadors"),
+                      ("paragraph", "2. Que em comprometo a dedicar els mitjans necessaris a l'execució del contracte.")])]
+    cands, _, _ = collect(pages)
+    by_text = {c.text[:6]: c for c in cands}
+    assert by_text["1. Que"].decision == "body" and by_text["2. Que"].decision != "heading"
+
+
+def test_tagged_headings_count_only_when_the_pdf_tags_titles():
+    from pageindex.headings.structure import _merge_tagged
+    good = [page(1, [("paragraph", "Gestión de citas"), ("paragraph", "Texto")])]
+    good[0]["tagged_headings"] = [{"level": 3, "text": "Gestión de citas"}]
+    out, _, _ = collect(good)
+    assert "tagged" in next(c for c in out if c.text == "Gestión de citas").sources
+    bad = [page(1, [("paragraph", "resumen de la ejecución y seguimiento de estas acciones.")])]
+    bad[0]["tagged_headings"] = [{"level": 1, "text": "resumen de la ejecución y seguimiento de estas acciones."}]
+    cands: list = []
+    _merge_tagged(cands, bad)
+    assert cands == []

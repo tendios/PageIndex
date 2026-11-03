@@ -155,9 +155,9 @@ class TypesafeHeadingJudge:
     name = "typesafe"
 
     def __init__(self, api_key: str, model: str = TYPESAFE_MODEL, base_url: str = TYPESAFE_URL,
-                 timeout: float = 90.0, workers: int = 4, session: Any = None,
+                 timeout: float = 90.0, workers: int = 8, session: Any = None,
                  pdf_path: Optional[str] = None, pages: Optional[list[dict[str, Any]]] = None,
-                 images: bool = False):
+                 images: bool = False, verify: bool = False):
         if not api_key:
             raise ValueError("The Typesafe judge needs an API key")
         self._api_key = api_key
@@ -171,6 +171,9 @@ class TypesafeHeadingJudge:
         self.pdf_path = pdf_path
         self.pages = pages
         self.images = images and pdf_path is not None and pages is not None
+        # A final pass over the finished tree: each heading the numbering or the rules accepted, checked against the
+        # rest of the index.
+        self.verify_pass = verify
         self.usage = {"input_tokens": 0, "output_tokens": 0, "requests": 0, "failed": 0, "images": 0}
 
     def decide(self, document: dict[str, Any], candidates: list[Candidate],
@@ -183,6 +186,49 @@ class TypesafeHeadingJudge:
         decided: dict[int, tuple[str, float]] = {}
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             for result in pool.map(lambda stretch: self._evaluate(candidates, stretch, shared), parts):
+                decided.update(result)
+        return decided
+
+    def verify(self, document: dict[str, Any], headings: list[Candidate]) -> dict[int, tuple[str, float]]:
+        """A last look at the tree: every heading checked against all the others, as a reader of the finished index
+        would («does this line really open a section of this document, or is it an item of a list, a row, a label?»).
+        Returns ``{candidate index: (choice, probability)}``."""
+        if not headings:
+            return {}
+        tree = [{"index": c.index, "page": c.page, "text": c.text[:OUTLINE_TEXT], **({"marker": c.marker} if c.marker else {})}
+                for c in headings]
+        shared = {"convention": CONVENTION, "document": document, "tree": tree}
+        ask = [c for c in headings if getattr(c, "_verify", False)]
+        groups = [ask[i:i + STRETCH_LINES] for i in range(0, len(ask), STRETCH_LINES)]
+        decided: dict[int, tuple[str, float]] = {}
+
+        def run(group: list[Candidate]) -> dict[int, tuple[str, float]]:
+            state = {**shared, "lines": [line_state(c) for c in group]}
+            questions = {f"line_{i}": {
+                "type": "choice",
+                "instructions": f"state.tree es el índice que se ha construido de este documento, en orden. ¿La línea "
+                                f"state.lines[{i}] (la de index {c.index} en state.tree) abre de verdad un apartado del "
+                                "documento, que alguien puede pedir por su número o su título, o es contenido que se ha "
+                                "tomado por título: un elemento de una lista, una fila de una tabla, una etiqueta de "
+                                "formulario, una frase? Compárala con los títulos de alrededor en state.tree y aplica "
+                                "state.convention.",
+                "criteria": CRITERIA} for i, c in enumerate(group)}
+            try:
+                answers = self._post({"model": self.model, "state": state, "questions": questions})
+            except Exception as exc:
+                self.usage["failed"] += 1
+                logger.warning("headings verify request failed (%d lines): %s", len(group), exc)
+                return {}
+            out: dict[int, tuple[str, float]] = {}
+            for i, c in enumerate(group):
+                answer = answers.get(f"line_{i}") or {}
+                choice = answer.get("choice")
+                if answer.get("type") == "choice" and choice in CRITERIA:
+                    out[c.index] = (choice, float((answer.get("probabilities") or {}).get(choice, 0.0)))
+            return out
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            for result in pool.map(run, groups):
                 decided.update(result)
         return decided
 
