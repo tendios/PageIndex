@@ -470,8 +470,9 @@ class PageIndexClient:
         heading_judge (str | dict, optional): Local mode only — who decides,
             in ``mode="headings"``, the lines no rule settles: ``"typesafe"``
             (Jev, key from ``TYPESAFE_AI_API_KEY`` or ``{"name": "typesafe",
-            "api_key": ..., "model": ..., "base_url": ...}``) or ``"none"``
-            (the rules alone). Defaults to none.
+            "api_key": ..., "model": ..., "base_url": ...}``), ``"none"``
+            (the rules alone) or ``"auto"`` (the default: Jev when
+            ``TYPESAFE_AI_API_KEY`` is set, the rules otherwise).
         summary_language (str, optional): Local mode only — the language of
             the node summaries and the document description: unset, the
             document's own language; a language name («Spanish») forces it.
@@ -667,9 +668,10 @@ class PageIndexClient:
                         f'{shown} must be "full", "merge" or "off", got {value!r}.')
                 if name == "heading_judge":
                     judge_name = value if isinstance(value, str) else value.get("name")
-                    if (judge_name or "").strip().lower() not in ("typesafe", "none"):
+                    if (judge_name or "").strip().lower() not in ("auto", "typesafe", "none"):
                         raise PageIndexAPIError(
-                            f'{shown} must be "typesafe", "none" or a dict with name="typesafe", got {value!r}.')
+                            f'{shown} must be "auto", "typesafe", "none" or a dict with name="typesafe", '
+                            f'got {value!r}.')
                 if name == "pdf_parser":
                     from .pdf_extraction import parser_config
                     try:
@@ -862,18 +864,23 @@ class PageIndexClient:
         ``get_document(doc_id)['status']`` yourself.
 
         Local: indexes the document in this call and stores it under
-        ``storage_path``. Defaults to Flash indexing: layout-based extraction,
-        refined for retrieval (a deterministic merge, then an LLM expansion
-        pass); node summaries, the expansion pass, and the document
+        ``storage_path``. With ``pdf_parser="liteparse"`` it defaults to
+        ``mode="headings"``: the tree from the document's own headings
+        (LiteParse's heading blocks, the numbering, the index pages, the
+        layout titles and the ``heading_judge`` for the doubtful lines), no
+        optimizer. Otherwise it defaults to Flash indexing: layout-based
+        extraction, refined for retrieval (a deterministic merge, then an
+        LLM expansion pass). In both, node summaries and the document
         description use ``summary_model``. Pass ``mode="standard"`` for a
         full LLM-built tree (slower). ``beta_headers`` and ``folder_id`` are
         cloud-only.
 
         Args:
             file_path (str): Path to the PDF file.
-            mode (str, optional): Processing mode. Local defaults to "flash";
-                pass "standard" for a full LLM-built tree. Cloud modes are
-                passed through (e.g. "mcp").
+            mode (str, optional): Processing mode. Local: "headings" (the
+                default with pdf_parser="liteparse", which it needs), "flash"
+                (the default otherwise) or "standard" (a full LLM-built
+                tree). Cloud modes are passed through (e.g. "mcp").
             beta_headers (list[str], optional): Cloud-only beta feature headers.
             folder_id (str, optional): Cloud-only folder (workspace) ID.
             metadata (dict, optional): Your own JSON-serializable tags for the
@@ -3118,7 +3125,8 @@ class PageIndexLocalClient(PageIndexClient):
                          summary_concurrency=summary_concurrency,
                          summary_reasoning_effort=summary_reasoning_effort,
                          use_embedded_toc=use_embedded_toc, optimize=optimize,
-                         pdf_parser=pdf_parser,
+                         pdf_parser=pdf_parser, heading_judge=heading_judge,
+                         summary_language=summary_language,
                          retrieve_model=retrieve_model, storage_path=storage_path,
                          index_backend=index_backend, chat_backend=chat_backend,
                          instructions=instructions)
