@@ -62,7 +62,8 @@ class LocalAPI:
         self._optimize = optimize
         from .pdf_extraction import parser_config
         self._pdf_parser = parser_config(pdf_parser)
-        # mode="headings": who decides the lines no rule settles; None or "none" leaves them to the rules.
+        # mode="headings": who decides the lines no rule settles: "typesafe" (Jev), "none" (the rules) or
+        # "auto" (the default: Jev when TYPESAFE_AI_API_KEY is set).
         self._heading_judge = heading_judge
         # The language of summaries and description: None for the document's own, or a language name to force.
         self._summary_language = summary_language
@@ -141,10 +142,11 @@ class LocalAPI:
         if mode not in (None, "standard", "flash", "headings"):
             raise PageIndexAPIError(
                 f"Failed to submit document: unknown local processing mode {mode!r}. "
-                "Supported: 'flash' (default), 'standard' or 'headings'."
+                "Supported: 'headings' (the default with pdf_parser='liteparse'), "
+                "'flash' (the default otherwise) or 'standard'."
             )
         if mode is None:
-            mode = "flash"
+            mode = self.default_mode
         if mode == "standard" and (self._summary_max_words is not None
                                    or self._summary_concurrency is not None
                                    or self._summary_reasoning_effort is not None):
@@ -380,18 +382,31 @@ class LocalAPI:
         )
         return structure, description
 
+    @property
+    def default_mode(self) -> str:
+        """The mode of a submit that names none: ``headings`` when LiteParse reads the PDF (its blocks are the
+        headings), ``flash`` with the default reader, as upstream."""
+        return "headings" if self._pdf_parser["name"] == "liteparse" else "flash"
+
     def _heading_judge_instance(self):
-        """The judge of mode="headings": Typesafe's Jev with the configured key (or TYPESAFE_AI_API_KEY), or
-        none, which leaves the undecided lines to the rules."""
+        """The judge of mode="headings": Typesafe's Jev with the configured key, or none, which leaves the
+        undecided lines to the rules. Unset or ``"auto"``: Jev when TYPESAFE_AI_API_KEY is in the environment,
+        the rules otherwise."""
         conf = self._heading_judge
-        if conf is None or conf == "none" or conf == "":
+        if conf is None or conf == "":
+            conf = "auto"
+        if conf == "none":
             return None
         if isinstance(conf, str):
             conf = {"name": conf}
         name = (conf.get("name") or "").strip().lower()
+        if name == "auto":  # Jev when a key is at hand (the dict's or the environment's), the rules otherwise
+            if not (conf.get("api_key") or os.environ.get("TYPESAFE_AI_API_KEY", "")):
+                return None
+            conf, name = {**conf, "name": "typesafe"}, "typesafe"
         if name != "typesafe":
             raise PageIndexAPIError(
-                f"Failed to submit document: unknown heading_judge {name!r}; use \"typesafe\" or \"none\".")
+                f"Failed to submit document: unknown heading_judge {name!r}; use \"auto\", \"typesafe\" or \"none\".")
         api_key = conf.get("api_key") or os.environ.get("TYPESAFE_AI_API_KEY", "")
         if not api_key:
             raise PageIndexAPIError(
