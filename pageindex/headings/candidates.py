@@ -50,6 +50,16 @@ class Candidate:
     bold: bool = False
     # Dot leaders and a page number at the end («3. OBJECTE ........ 12»): an entry of the document's index.
     leaders: bool = False
+    # The numbering the line opens with (see numbering.parse), its font size and the body's, and its block.
+    mark: Any = None
+    size: Optional[float] = None
+    block_id: Optional[str] = None
+    bbox: Optional[list] = None
+    # Cut from a block where an earlier title runs into it («Novena. Aptitud 9.1 Estan…»).
+    inline: bool = False
+    # How the numbering spine read it: continue, start, restart, gap, break; and its rank in the hierarchy.
+    seq: str = ""
+    rank: Optional[int] = None
 
     @property
     def level_hint(self) -> int:
@@ -152,7 +162,10 @@ def _lines_of(pages: list[dict[str, Any]]) -> list[Candidate]:
         for order, block in enumerate(blocks):
             kind = block.get("block_type") or ""
             text = (block.get("text") or "").strip()
-            if not text or kind == "table":
+            if not text:
+                continue
+            if kind == "table":
+                out.extend(_table_row_candidates(text, page_no, order, len(out)))
                 continue
             lines = [text.split("\n")[0].strip()] if kind != "page" else [l.strip() for l in text.split("\n") if l.strip()]
             for sub, first in enumerate(lines):
@@ -176,6 +189,35 @@ def _lines_of(pages: list[dict[str, Any]]) -> list[Candidate]:
                                      heading_block=heading_block, marker=marker, numbered=numbered,
                                      keyword=keyword, sources={"liteparse"}, previous=previous, following=following,
                                      page_numbered=page_numbered, bold=bold, leaders=leaders))
+    return out
+
+
+_ROW_SPLIT = re.compile(r"(?<!\\)\|")
+
+
+def _table_row_candidates(text: str, page_no: int, order: int, first_index: int) -> list[Candidate]:
+    """The rows of a table whose first cell opens with the document's numbering: the sections of a summary sheet
+    («14 GARANTÍAS | …», «B.1 ADMINISTRACIÓN CONTRATANTE | …»). The candidate is the first cell, joined with the
+    second when the first holds only the number."""
+    out: list[Candidate] = []
+    rows = [r for r in text.split("\n") if r.strip().startswith("|") and not re.fullmatch(r"[|\s:-]+", r.strip())]
+    for sub, row in enumerate(rows):
+        cells = [re.sub(r"<br>|\s+", " ", c).replace("\\|", "|").strip() for c in _ROW_SPLIT.split(row.strip().strip("|"))]
+        cells = [c for c in cells if c]
+        if not cells:
+            continue
+        title = cells[0]
+        if re.fullmatch(r"[0-9]{1,2}(?:\.[0-9]{1,2}){0,3}\.?|[A-Z](?:\.[0-9]{1,2}){0,2}\.?", title) and len(cells) > 1:
+            title = f"{title} {cells[1]}"
+        bold = "**" in title
+        title = re.sub(r"(\*{1,3}|_{2,3})(?=\S)|(?<=\S)(\*{1,3}|_{2,3})", "", title).strip()
+        marker, numbered, keyword = marker_of(title)
+        if not (numbered or keyword) or len(title) > MAX_TEXT:
+            continue
+        following = " ".join(cells[1:])[:120] if title == cells[0] else " ".join(cells[2:])[:120]
+        out.append(Candidate(index=first_index + len(out), page=page_no, order=order * 1000 + sub, text=title,
+                             marker=marker, numbered=numbered, keyword=keyword, sources={"table"}, bold=bold,
+                             following=following, page_numbered=_carries_page_number(title, page_no, keyword)))
     return out
 
 

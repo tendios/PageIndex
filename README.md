@@ -32,7 +32,7 @@
 Este fork parte de [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) `v0.5.1` y se publica con etiquetas `v<upstream>-tendios.<n>` (versión del paquete `<upstream>+tendios.<n>`); fija una etiqueta, nunca `main`:
 
 ```bash
-pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.1-tendios.1"
+pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.1-tendios.2"
 ```
 
 ### Diferencias con upstream
@@ -52,7 +52,7 @@ Las extensiones de indexado se activan en modo local; el modo cloud conserva su 
 Instalación de la versión del fork con LiteParse:
 
 ```bash
-pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.5.1-tendios.1"
+pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.5.1-tendios.2"
 ```
 
 Para desarrollar desde este checkout:
@@ -113,15 +113,43 @@ client = PageIndexClient(index={"mode": "local", "model": "anthropic/claude-haik
 client.submit_document("pcap.pdf")                            # mode="headings" por defecto con LiteParse
 ```
 
-El juez (`heading_judge`) es Jev, de Typesafe, un clasificador determinista: recibe el esquema del documento (línea,
-página, número, nivel de encabezado del lector, si la maquetación la detectó, si repite número) y decide «abre un
-apartado» o «es contenido», por líneas o por grupos de hermanos numerados. Añade un título que las reglas no vieron a
-partir de 0,60 de probabilidad y solo quita uno a partir de 0,85; si falla una petición, las reglas deciden y el
-indexado no se interrumpe. `heading_judge` admite `"auto"` (por defecto: Jev con la clave de `TYPESAFE_AI_API_KEY`,
-las reglas solas si no la hay), `"typesafe"` (exige la clave), `"none"` (las reglas solas) o un diccionario
-`{"name": "typesafe" | "auto", "api_key": ..., "model": ..., "base_url": ..., "timeout": ..., "workers": ...}`. En diez pliegos e informes reales (440 páginas) las reglas solas recuperan el 98 % de los
-títulos numerados; el modo flash con optimizador, el 51 %. `get_tree()` devuelve en `features.pdf_extraction.headings`
-el recuento de candidatos, los decididos por reglas y por el juez, y `structure_backend: "headings"`.
+Cómo se decide cada línea:
+
+- **Candidatos**: los bloques de LiteParse, las filas de tabla numeradas en secuencia (los apartados de un cuadro
+  resumen; las tablas de inventario con cantidades no cuentan), las líneas numeradas dentro de un bloque y los títulos
+  que el lector pegó a otro texto («…DEL CONTRACTE Dinovena. Condicions…», «…de crèdit. 3.5 S'han…»), sin cortar en
+  una cita («art. 22.1»). Las páginas de índice se detectan por sus puntos de relleno o porque sus títulos reaparecen
+  después en el mismo orden; sus entradas no son nodos.
+- **Columna de numeración**: cada familia de marcadores (decimal «2.3», letra «B.1», romano, ordinal en castellano y
+  catalán «Vigésima primera», «Vint-i-setena», palabra clave «Cláusula 12», «Sección primera», «Annex III») se sigue
+  como lo haría un lector: una línea continúa la secuencia (siguiente hermano, primer hijo, un hueco corto) o no. Un
+  reinicio exige aspecto de título y continuación. Una cláusula fija el número de sus subapartados («Novena» es el padre
+  de «9.1»); los «1., 2., 3.» que empiezan de nuevo dentro de una cláusula y se leen como frases son su lista.
+- **Estilo**: negrita y tamaño de letra de LiteParse frente a los del cuerpo (la negrita no cuenta si el cuerpo ya lo es),
+  marca de encabezado del lector y títulos de la maquetación de flash.
+- **Juez**: lo que ni la numeración ni el estilo resuelven lo decide Jev, de Typesafe, por líneas o por grupos de
+  hermanos numerados. Añade un título a partir de 0,60 de probabilidad y solo quita uno a partir de 0,85; si falla una
+  petición, deciden las reglas y el indexado sigue. `heading_judge={"name": "auto", "images": True}` le envía además un
+  recorte de la página con la línea marcada (tamaño, negrita, sangría, posición).
+- **Niveles**: por familia (Libro > Título/Parte > Capítulo > Sección > cláusula > subapartados decimales), con los
+  contenedores sin número («CUADRO RESUMEN», «QUADRE DE CARACTERÍSTIQUES») sobre lo que abren.
+
+Medido en 14 pliegos reales (664 páginas, castellano y catalán, PCAP, PPT y cuadros resumen; 1.232 títulos de
+referencia anotados por Claude Opus 5.5 con tres muestras y adjudicación de los desacuerdos):
+
+| | F1 | Padre correcto |
+| --- | --- | --- |
+| `tendios.9`, reglas | 59,4 % | 60,8 % |
+| `tendios.9`, con Jev | 72,4 % | 59,9 % |
+| esta versión, reglas | 87,4 % | 79,2 % |
+| esta versión, con Jev | 89,7 % | 83,1 % |
+| esta versión, Jev con imágenes | 90,5 % | 83,7 % |
+
+`get_tree()` devuelve en `features.pdf_extraction.headings` el recuento de candidatos, los decididos por la numeración,
+por el juez y por las reglas, y `structure_backend: "headings"`.
+
+LiteParse lee como texto espacial una página que convierte en una tabla de pocas filas con el cuerpo en una celda (la
+banda de firma electrónica en el margen lo provoca): sus bloques mezclaban las columnas.
 
 ### Idioma de los resúmenes
 

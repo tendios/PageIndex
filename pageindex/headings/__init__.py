@@ -38,11 +38,12 @@ def build_headings_structure(pages: list[dict[str, Any]], page_texts: list[str],
                              layout_structure: Optional[list[dict]] = None,
                              judge: Optional[HeadingJudge] = None,
                              document: Optional[dict[str, Any]] = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """The structure and a report of how it was built: candidates, how many needed no judge, how many the judge
-    decided, how many fell to the rules, and the headings kept."""
+    """The structure and a report of how it was built: candidates, how many the numbering spine settled, how many
+    the judge decided, how many fell to the rules, and the headings kept."""
     from ..flash.api import _add_intros, _add_preface, _page_lines
-    candidates, report = collect(pages, layout_structure)
-    ask = [c for c in candidates if not c.known]
+    from .structure import build, collect, decide_unsettled, ranks
+    candidates, report, body = collect(pages, layout_structure)
+    ask = [c for c in candidates if c.decision is None]
     judged: dict[int, tuple[str, float]] = {}
     if judge is not None and ask:
         try:
@@ -50,15 +51,17 @@ def build_headings_structure(pages: list[dict[str, Any]], page_texts: list[str],
         except Exception as exc:  # the rules decide; indexing goes on
             logger.warning("headings judge unavailable, deciding by rules: %s", exc)
             report["judge_error"] = str(exc)[:200]
+    numbered = sum(1 for c in candidates if c.decision == "heading" and c.mark is not None) >= 8
     for c in ask:
-        rule = decide_without_judge(c)
+        rule = decide_unsettled(c, body, numbered)
         if c.index not in judged:
             c.decision, c.reason = rule, "rule"
             continue
         choice, probability = judged[c.index]
         c.decision, c.reason = _settle(rule, choice, probability)
     headings = [c for c in candidates if c.decision == "heading"]
-    structure = build_structure(headings, len(page_texts))
+    ranks(headings)
+    structure = build(headings, len(page_texts))
     if structure:
         lines = _page_lines(page_texts)
         if structure[0]["start_index"] > 1:
@@ -71,6 +74,6 @@ def build_headings_structure(pages: list[dict[str, Any]], page_texts: list[str],
         "judge": getattr(judge, "name", None) if judge is not None else None,
         "judge_usage": getattr(judge, "usage", None) if judge is not None else None,
         "decisions": [{"page": c.page, "text": c.text[:80], "decision": c.decision, "reason": c.reason,
-                       "sources": sorted(c.sources)} for c in candidates],
+                       "seq": c.seq, "rank": c.rank, "sources": sorted(c.sources)} for c in candidates],
     })
     return structure, report

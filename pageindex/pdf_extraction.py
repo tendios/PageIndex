@@ -76,6 +76,16 @@ def _bbox(rect: dict, width: float, height: float) -> list[float]:
              (x + w) / width * 1000, (y + h) / height * 1000)]
 
 
+def _swallowing_table(block: dict, width: float, height: float) -> bool:
+    if block.get("kind") != "table" or not block.get("bbox"):
+        return False
+    rows = ([block["header"]] if block.get("header") else []) + list(block.get("rows") or [])
+    box = block["bbox"]
+    area = box.get("width", 0) * box.get("height", 0) / (width * height)
+    longest = max((len(str(cell.get("text") or "")) for row in rows for cell in row), default=0)
+    return len(rows) <= 4 and area >= 0.5 and longest >= 1200
+
+
 def _page_record(page: dict, conf: dict, routed: bool) -> dict:
     number, width, height = page["page_num"], page["width"], page["height"]
     if width <= 0 or height <= 0:
@@ -90,6 +100,10 @@ def _page_record(page: dict, conf: dict, routed: bool) -> dict:
     use_spatial = conf["text_format"] == "spatial" or (
         conf["text_format"] == "auto" and column_lines >= 3
         and not any(b.get("kind") == "table" for b in raw_blocks))
+    # A page read as one table of a few rows that holds the body in a cell (an e-signature band down the
+    # margin makes the reader see two columns): its blocks interleave the text, the spatial text does not.
+    use_spatial = use_spatial or (conf["text_format"] == "auto" and any(_swallowing_table(b, width, height)
+                                                                         for b in raw_blocks))
     rendered = [(block, _block_text(block)) for block in raw_blocks]
     rendered = [(block, text) for block, text in rendered if text.strip()]
     if use_spatial or not rendered:

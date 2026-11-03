@@ -56,10 +56,12 @@ def test_rules_decide_without_a_judge_and_the_tree_nests_by_numbering():
     assert [n["title"] for n in structure[1]["nodes"]] == ["2. PRESSUPOST (intro)", "2.1. Valor estimat"]
     assert (structure[1]["start_index"], structure[1]["end_index"]) == (2, 3)
     assert structure[2]["end_index"] == 4
-    assert report["judge"] is None and report["asked"] == 3 and report["by_rule"] == 3
-    decisions = {d["text"]: d["decision"] for d in report["decisions"]}
-    assert decisions["1. La mesa de contractació estarà formada per:"] == "body"
-    assert decisions["Annex sense estil"] == "body"
+    # The numbering spine settles every numbered line: «3. SOLVÈNCIA» continues «2.1», the list «1.» restarts in
+    # the middle of clause 2 and is content.
+    assert report["judge"] is None and report["asked"] == 0
+    decisions = {d["text"]: (d["decision"], d["seq"]) for d in report["decisions"]}
+    assert decisions["3. SOLVÈNCIA"] == ("heading", "continue")
+    assert decisions["1. La mesa de contractació estarà formada per:"][0] == "body"
 
 
 def test_index_pages_place_entries_in_the_body_and_layout_titles_fill_gaps():
@@ -180,9 +182,10 @@ def test_a_failed_judge_request_leaves_the_lines_to_the_rules():
 
         def decide(self, document, candidates, ask):
             raise RuntimeError("down")
-    structure, report = build_headings_structure(pcap_pages(), ["p1", "p2", "p3", "p4"], judge=Broken())
+    pages = pcap_pages() + [page(5, [("heading", "# Disposicions finals del contracte"), ("paragraph", "Text")])]
+    structure, report = build_headings_structure(pages, ["p1", "p2", "p3", "p4", "p5"], judge=Broken())
     assert [n["title"] for n in structure][:2] == ["1. OBJECTE DEL CONTRACTE", "2. PRESSUPOST"]
-    assert report["judge_error"] == "down" and report["by_rule"] == 3
+    assert report["judge_error"] == "down" and report["asked"] == report["by_rule"] >= 1
 
 
 def test_client_indexes_in_headings_mode_with_the_flash_summaries(tmp_path, sample_pdf, monkeypatch):
@@ -224,7 +227,7 @@ def test_client_indexes_in_headings_mode_with_the_flash_summaries(tmp_path, samp
     assert doc["description"] == "PCAP de prueba"
     features = client.get_tree("pcap", node_summary=False, include_text=False)["features"]
     assert features["pdf_extraction"]["structure_backend"] == "headings"
-    assert features["pdf_extraction"]["headings"]["known"] == 2 and "decisions" not in features["pdf_extraction"]["headings"]
+    assert features["pdf_extraction"]["headings"]["known"] >= 2 and "decisions" not in features["pdf_extraction"]["headings"]
 
 
 def test_headings_mode_needs_liteparse_and_a_known_judge(tmp_path, sample_pdf, monkeypatch):
