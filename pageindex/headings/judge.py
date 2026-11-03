@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 TYPESAFE_URL = "https://api.typesafe.ai/v1"
 TYPESAFE_MODEL = "jev-latest"
 STRETCH_LINES = 40
+IMAGE_STRETCH_LINES = 16
 CONTEXT_LINES = 40
 MAX_STATE_CHARS = 35_000
 OUTLINE_TEXT = 80
@@ -154,7 +155,9 @@ class TypesafeHeadingJudge:
     name = "typesafe"
 
     def __init__(self, api_key: str, model: str = TYPESAFE_MODEL, base_url: str = TYPESAFE_URL,
-                 timeout: float = 90.0, workers: int = 4, session: Any = None):
+                 timeout: float = 90.0, workers: int = 4, session: Any = None,
+                 pdf_path: Optional[str] = None, pages: Optional[list[dict[str, Any]]] = None,
+                 images: bool = False):
         if not api_key:
             raise ValueError("The Typesafe judge needs an API key")
         self._api_key = api_key
@@ -163,14 +166,20 @@ class TypesafeHeadingJudge:
         self.timeout = timeout
         self.workers = max(1, workers)
         self._session = session
-        self.usage = {"input_tokens": 0, "output_tokens": 0, "requests": 0, "failed": 0}
+        # With the PDF and its stored pages, each asked line goes with a crop of its page: size, weight, indent
+        # and position are what a reader sees and the text alone does not carry.
+        self.pdf_path = pdf_path
+        self.pages = pages
+        self.images = images and pdf_path is not None and pages is not None
+        self.usage = {"input_tokens": 0, "output_tokens": 0, "requests": 0, "failed": 0, "images": 0}
 
     def decide(self, document: dict[str, Any], candidates: list[Candidate],
                ask: list[Candidate]) -> dict[int, tuple[str, float]]:
         if not ask:
             return {}
         shared = {"convention": CONVENTION, "document": document, "clauses": clauses(candidates)}
-        parts = stretches(sibling_groups(ask))
+        # with page crops a request carries far more tokens: fewer lines per request
+        parts = stretches(sibling_groups(ask), IMAGE_STRETCH_LINES if self.images else STRETCH_LINES)
         decided: dict[int, tuple[str, float]] = {}
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             for result in pool.map(lambda stretch: self._evaluate(candidates, stretch, shared), parts):
@@ -179,11 +188,26 @@ class TypesafeHeadingJudge:
 
     def _evaluate(self, candidates: list[Candidate], stretch: list[list[Candidate]],
                   shared: dict[str, Any]) -> dict[int, tuple[str, float]]:
-        state = {**shared, "outline": outline_window(candidates, stretch),
-                 "lines": [line_state(g[0]) if len(g) == 1 else {"siblings": [line_state(c) for c in g]} for g in stretch]}
+        lines = [line_state(g[0]) if len(g) == 1 else {"siblings": [line_state(c) for c in g]} for g in stretch]
+        images: dict[str, bytes] = {}
+        if self.images:
+            from .crops import line_crop
+            for i, group in enumerate(stretch):
+                for k, c in enumerate(group):
+                    png = line_crop(self.pdf_path, self.pages, c)
+                    if png is None:
+                        continue
+                    ref = f"[linea-{c.index}]"
+                    images[ref] = png
+                    target = lines[i] if len(group) == 1 else lines[i]["siblings"][k]
+                    target["imagen"] = ref
+        state = {**shared, "outline": outline_window(candidates, stretch), "lines": lines}
+        if images:
+            state["imagenes"] = ("Cada línea preguntada lleva en `imagen` un recorte de su página: la línea marcada con un "
+                                 "recuadro rojo y su entorno. Úsalo para ver tamaño, negrita, sangría y posición.")
         questions = {f"line_{i}": question(g, i) for i, g in enumerate(stretch)}
         try:
-            answers = self._post({"model": self.model, "state": state, "questions": questions})
+            answers = self._post({"model": self.model, "state": state, "questions": questions}, images)
         except Exception as exc:  # a failed request: halves, then the rules
             self.usage["failed"] += 1
             logger.warning("headings judge request failed (%d lines): %s", sum(len(g) for g in stretch), exc)
@@ -203,13 +227,24 @@ class TypesafeHeadingJudge:
                 decided[c.index] = (choice, probability)
         return decided
 
-    def _post(self, body: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, body: dict[str, Any], images: Optional[dict[str, bytes]] = None) -> dict[str, Any]:
         session = self._session
         if session is None:
             import requests
             session = requests
-        response = session.post(f"{self.base_url}/systemone", json=body, timeout=self.timeout,
-                                headers={"Authorization": f"Bearer {self._api_key}"})
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        if images:
+            # TypeSafe's multipart form: the request as JSON plus one part per image, named in `assets`.
+            import json as _json
+            parts = {ref: f"image-{n}" for n, ref in enumerate(images)}
+            body = {**body, "assets": {ref: {"type": "image", "part": part} for ref, part in parts.items()}}
+            files = {"request": ("request.json", _json.dumps(body, ensure_ascii=False).encode(), "application/json")}
+            files.update({part: (f"{part}.png", images[ref], "image/png") for ref, part in parts.items()})
+            self.usage["images"] += len(images)
+            response = session.post(f"{self.base_url}/systemone", files=files, timeout=self.timeout,
+                                    headers={**headers, "TypeSafe-Danger-Zone-Images": "true"})
+        else:
+            response = session.post(f"{self.base_url}/systemone", json=body, timeout=self.timeout, headers=headers)
         response.raise_for_status()
         payload = response.json()
         usage = payload.get("usage") or {}

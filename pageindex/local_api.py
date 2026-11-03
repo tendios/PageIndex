@@ -388,7 +388,7 @@ class LocalAPI:
         headings), ``flash`` with the default reader, as upstream."""
         return "headings" if self._pdf_parser["name"] == "liteparse" else "flash"
 
-    def _heading_judge_instance(self):
+    def _heading_judge_instance(self, pdf_path: str | None = None, pages: list | None = None):
         """The judge of mode="headings": Typesafe's Jev with the configured key, or none, which leaves the
         undecided lines to the rules. Unset or ``"auto"``: Jev when TYPESAFE_AI_API_KEY is in the environment,
         the rules otherwise."""
@@ -413,9 +413,11 @@ class LocalAPI:
                 "Failed to submit document: heading_judge \"typesafe\" needs an api_key, or TYPESAFE_AI_API_KEY "
                 "in the environment.")
         from .headings import TYPESAFE_MODEL, TYPESAFE_URL, TypesafeHeadingJudge
+        # "images": True sends each doubtful line with a crop of its page (size, weight, indent, position).
         return TypesafeHeadingJudge(api_key=api_key, model=conf.get("model") or TYPESAFE_MODEL,
                                     base_url=conf.get("base_url") or TYPESAFE_URL,
-                                    timeout=float(conf.get("timeout") or 90), workers=int(conf.get("workers") or 4))
+                                    timeout=float(conf.get("timeout") or 90), workers=int(conf.get("workers") or 4),
+                                    pdf_path=pdf_path, pages=pages, images=bool(conf.get("images")))
 
     def _index_headings(self, file_path: str, extraction, page_texts: list[str],
                         doc_name: str) -> tuple[list, str | None]:
@@ -442,7 +444,8 @@ class LocalAPI:
         except Exception as exc:  # scanned or odd PDFs: the headings alone decide
             logger.info("headings: layout detection unavailable (%s)", exc)
         structure, report = build_headings_structure(
-            extraction.pages, page_texts, layout_structure, judge=self._heading_judge_instance(),
+            extraction.pages, page_texts, layout_structure,
+            judge=self._heading_judge_instance(file_path, extraction.pages),
             document={"name": doc_name, "pages": len(page_texts)})
         backend = "headings"
         if not structure:
