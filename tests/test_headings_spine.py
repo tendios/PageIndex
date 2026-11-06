@@ -126,3 +126,26 @@ def test_tagged_headings_count_only_when_the_pdf_tags_titles():
     cands: list = []
     _merge_tagged(cands, bad)
     assert cands == []
+
+
+def test_unnumbered_titles_are_siblings_under_their_section_not_a_chain():
+    """An announcement with no numbering at all (PLACSP's «Anuncio de licitación») is a run of unranked titles: they
+    sit side by side, not each one level under the previous; under a numbered section they all hang from it."""
+    from pageindex.headings.candidates import Candidate
+    from pageindex.headings.structure import build
+
+    def head(order, text, rank=None, page=1):
+        c = Candidate(index=order, page=page, order=order, text=text)
+        c.rank = rank
+        return c
+
+    flat = build([head(k, t) for k, t in enumerate(
+        ["Entidad Adjudicadora", "Dirección Postal", "Proceso de Licitación", "Plazo de Presentación"])], 1)
+    assert [n["title"] for n in flat] == ["Entidad Adjudicadora", "Dirección Postal", "Proceso de Licitación",
+                                         "Plazo de Presentación"]
+    assert not any(n.get("nodes") for n in flat)
+
+    tree = build([head(0, "1. Objeto", 1), head(1, "Lotes"), head(2, "Plazos"), head(3, "2. Precio", 1),
+                  head(4, "Revisión")], 1)
+    assert [(n["title"], [c["title"] for c in n.get("nodes", [])]) for n in tree] == [
+        ("1. Objeto", ["Lotes", "Plazos"]), ("2. Precio", ["Revisión"])]

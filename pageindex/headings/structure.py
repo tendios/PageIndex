@@ -535,10 +535,15 @@ def build(headings: list[Candidate], total_pages: int) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     stack: list[tuple[int, dict]] = []  # (rank, node)
     roots: list[dict[str, Any]] = []
+    section = 0  # the rank of the last heading the rules ranked: the section the unranked ones sit in
     for c in ordered:
         rank = c.rank
         if rank is None:
-            rank = (stack[-1][0] + 1) if stack else 1
+            # One under that section, as siblings of each other: under the previous heading instead, a run of
+            # unnumbered titles (a form, an announcement) nests one level deeper at each.
+            rank = section + 1
+        else:
+            section = rank
         while stack and stack[-1][0] >= rank:
             stack.pop()
         node = {"title": _title(c), "start_index": c.page, "end_index": c.page, "nodes": [], "_rank": rank}
