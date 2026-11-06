@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from importlib.metadata import version
 from pathlib import Path
 from time import perf_counter
@@ -18,6 +18,8 @@ from time import perf_counter
 class PDFExtraction:
     pages: list[dict]
     metadata: dict
+    # Seconds per indexing stage, for the caller's log; never stored with the document.
+    timings: dict = field(default_factory=dict)
 
     @property
     def texts(self) -> list[str]:

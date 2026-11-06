@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import re
 import uuid
+from time import perf_counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -164,6 +165,7 @@ class LocalAPI:
             )
 
         extraction = None
+        started = perf_counter()
         try:
             if self._pdf_parser["name"] == "liteparse":
                 from .pdf_extraction import extract_liteparse
@@ -182,6 +184,10 @@ class LocalAPI:
                 "Failed to submit document: PDF has no content. All pages are blank."
             )
         self._unique_doc_name(doc_name, doc_id if replace else None)
+        # Seconds per stage, returned with the result: extract, then the mode's own stages, then save.
+        timings = {"extract": perf_counter() - started}
+        if extraction is not None:
+            extraction.timings = timings
 
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
                  "prompt_tokens_details": {"cached_tokens": 0,
@@ -212,6 +218,7 @@ class LocalAPI:
         except Exception as e:
             raise PageIndexAPIError(f"Failed to submit document: {e}") from e
         self._check_page_bounds(structure, len(page_texts))
+        tick = perf_counter()
 
         if doc_id is None:
             doc_id = "pi-" + uuid.uuid4().hex
@@ -239,7 +246,10 @@ class LocalAPI:
                 meta["pdf_extraction"] = extraction.metadata
             self._store.save_document(
                 doc_id, meta, remove_fields(structure, fields=["text"]), pages)
-        return {"doc_id": doc_id, "name": meta["name"], "usage": usage}
+        timings["save"] = perf_counter() - tick
+        timings["total"] = perf_counter() - started
+        return {"doc_id": doc_id, "name": meta["name"], "usage": usage,
+                "timings": {stage: round(seconds, 2) for stage, seconds in timings.items()}}
 
     def _check_doc_id_free(self, doc_id: str) -> None:
         if self._store.get_meta(doc_id) is not None:
@@ -434,6 +444,8 @@ class LocalAPI:
             raise PageIndexAPIError(
                 "Failed to submit document: mode='headings' reads the headings LiteParse finds; configure "
                 "pdf_parser='liteparse'.")
+        timings = getattr(extraction, "timings", {})  # stubs in tests may lack it
+        tick = perf_counter()
         layout_structure = None
         try:
             # The layout titles flash detects, without its model passes: the same entry tests and callers stub.
@@ -444,10 +456,12 @@ class LocalAPI:
                 layout_structure = detected.get("structure")
         except Exception as exc:  # scanned or odd PDFs: the headings alone decide
             logger.info("headings: layout detection unavailable (%s)", exc)
+        timings["layout"], tick = perf_counter() - tick, perf_counter()
         structure, report = build_headings_structure(
             extraction.pages, page_texts, layout_structure,
             judge=self._heading_judge_instance(file_path, extraction.pages),
             document={"name": doc_name, "pages": len(page_texts)})
+        timings["headings"], tick = perf_counter() - tick, perf_counter()  # the rules and Jev, its final review included
         backend = "headings"
         if not structure:
             structure, backend = _page_nodes(page_texts), "headings_pages"
@@ -466,8 +480,10 @@ class LocalAPI:
                                concurrency=self._summary_concurrency,
                                max_words=self._summary_max_words or SUMMARY_MAX_WORDS,
                                reasoning_effort=effort, drop_refused_effort=defaulted))
+        timings["summaries"], tick = perf_counter() - tick, perf_counter()
         description = generate_doc_description(
             create_clean_structure_for_description(structure, top_level_only=True), model=summary_model)
+        timings["description"] = perf_counter() - tick
         return structure, description
 
     # ── tree / ocr ──

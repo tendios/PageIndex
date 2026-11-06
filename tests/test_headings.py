@@ -228,6 +228,10 @@ def test_client_indexes_in_headings_mode_with_the_flash_summaries(tmp_path, samp
     features = client.get_tree("pcap", node_summary=False, include_text=False)["features"]
     assert features["pdf_extraction"]["structure_backend"] == "headings"
     assert features["pdf_extraction"]["headings"]["known"] >= 2 and "decisions" not in features["pdf_extraction"]["headings"]
+    # Seconds per stage come back with the result, for the caller's log, and are not stored with the document.
+    assert set(result["timings"]) == {"extract", "layout", "headings", "summaries", "description", "save", "total"}
+    assert all(seconds >= 0 for seconds in result["timings"].values())
+    assert "timings" not in features["pdf_extraction"]
 
 
 def test_headings_mode_needs_liteparse_and_a_known_judge(tmp_path, sample_pdf, monkeypatch):
