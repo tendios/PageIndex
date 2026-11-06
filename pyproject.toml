@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pageindex"
-version = "0.5.1+tendios.4"
+version = "0.5.1+tendios.5"
 description = "Python SDK for PageIndex — reasoning-based, vectorless document retrieval, cloud and local"
 readme = "README.md"
 license = "MIT"
