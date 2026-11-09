@@ -199,12 +199,10 @@ def test_client_indexes_in_headings_mode_with_the_flash_summaries(tmp_path, samp
         p["markdown"] = p["markdown"] or "x"
     monkeypatch.setattr(pageindex.pdf_extraction, "extract_liteparse",
                         lambda path, conf: PDFExtraction(pages, {"parser": "liteparse", "layout": True, "ocr_pages": []}))
-    seen = {}
 
-    def fake_flash(pdf, **kwargs):
-        seen.update(kwargs)
-        return {"structure": [{"title": "2. PRESSUPOST", "start_index": 2, "end_index": 2}], "toc_source": "detected"}
-    monkeypatch.setattr(pageindex.flash, "page_index_flash", fake_flash)
+    def no_flash(pdf, **kwargs):
+        raise AssertionError("headings mode must not run flash's layout pass")
+    monkeypatch.setattr(pageindex.flash, "page_index_flash", no_flash)
     summarized = []
 
     async def fake_summarize(structure, page_list, model, **kwargs):
@@ -222,14 +220,13 @@ def test_client_indexes_in_headings_mode_with_the_flash_summaries(tmp_path, samp
     assert [n["title"] for n in tree] == ["1. OBJECTE DEL CONTRACTE", "2. PRESSUPOST"]
     assert tree[0]["summary"] == "resumen de 1. OBJECTE DEL CONTRACTE" and tree[0]["node_id"] == "0000"
     assert summarized == [("openai/gpt-test", 150)]
-    assert seen == {"summary": False, "optimize": False, "use_embedded_toc": True}
     doc = client.get_document("pcap")
     assert doc["description"] == "PCAP de prueba"
     features = client.get_tree("pcap", node_summary=False, include_text=False)["features"]
     assert features["pdf_extraction"]["structure_backend"] == "headings"
     assert features["pdf_extraction"]["headings"]["known"] >= 2 and "decisions" not in features["pdf_extraction"]["headings"]
     # Seconds per stage come back with the result, for the caller's log, and are not stored with the document.
-    assert set(result["timings"]) == {"extract", "layout", "headings", "summaries", "description", "save", "total"}
+    assert set(result["timings"]) == {"extract", "headings", "summaries", "description", "save", "total"}
     assert all(seconds >= 0 for seconds in result["timings"].values())
     assert "timings" not in features["pdf_extraction"]
 
