@@ -446,19 +446,11 @@ class LocalAPI:
                 "pdf_parser='liteparse'.")
         timings = getattr(extraction, "timings", {})  # stubs in tests may lack it
         tick = perf_counter()
-        layout_structure = None
-        try:
-            # The layout titles flash detects, without its model passes: the same entry tests and callers stub.
-            from .flash import page_index_flash
-            detected = page_index_flash(file_path, summary=False, optimize=False,
-                                        use_embedded_toc=self._use_embedded_toc)
-            if detected.get("toc_source") not in ("pages", "unreadable"):
-                layout_structure = detected.get("structure")
-        except Exception as exc:  # scanned or odd PDFs: the headings alone decide
-            logger.info("headings: layout detection unavailable (%s)", exc)
-        timings["layout"], tick = perf_counter() - tick, perf_counter()
+        # LiteParse's headings and Jev decide alone. Flash's layout pass used to add a vote: on the headings
+        # benchmark it was worth under a point of F1, and on some PDFs it spun for hours re-inflating the same
+        # streams, holding the GIL of every document indexing beside it.
         structure, report = build_headings_structure(
-            extraction.pages, page_texts, layout_structure,
+            extraction.pages, page_texts, None,
             judge=self._heading_judge_instance(file_path, extraction.pages),
             document={"name": doc_name, "pages": len(page_texts)})
         timings["headings"], tick = perf_counter() - tick, perf_counter()  # the rules and Jev, its final review included
