@@ -1092,6 +1092,9 @@ SUMMARY_CONCURRENCY = 128       # simultaneous summary model calls
 SUMMARY_INTRO_MAX_PAGES = 3     # cap on leading pages fed into a parent summary
 SUMMARY_MAX_WORDS = 150         # word cap the summary prompts ask for
 TOKENS_PER_WORD = 4 / 3
+# Text a summary call reads at most, counted as count_tokens counts (tiktoken). Sized for a 16k-token model:
+# Gemma's tokenizer counts up to 1.6x more on tables of figures (each digit its own token).
+SUMMARY_MAX_INPUT_TOKENS = 8000
 SUMMARY_REASONING_EFFORT = "none"
 
 
@@ -1238,6 +1241,33 @@ def strip_internal_keys(structure):
     return structure
 
 
+def truncate_to_tokens(text, max_tokens, model=None):
+    """The text cut at its end to about max_tokens; whole when it fits."""
+    tokens = count_tokens(text, model=model)
+    while tokens > max_tokens:
+        text = text[:max(0, int(len(text) * max_tokens / tokens * 0.95))]
+        tokens = count_tokens(text, model=model)
+    return text
+
+
+def split_oversized_leaves(structure, page_texts, max_tokens=SUMMARY_MAX_INPUT_TOKENS, model=None):
+    """A leaf of several pages whose text would not fit one summary call gets one child per page: a long run
+    with no heading inside (a table of figures, a scan) is then summarized whole, page by page, and search
+    can point at the page. Returns how many leaves were split."""
+    split = 0
+    for node in list(_subtree(structure)):
+        start, end = node.get('start_index'), node.get('end_index')
+        if node.get('nodes') or not isinstance(start, int) or not isinstance(end, int) or end <= start:
+            continue
+        if count_tokens(get_text_of_pdf_pages([(t, 0) for t in page_texts], start, end), model=model) <= max_tokens:
+            continue
+        title = (node.get('title') or '').strip()
+        node['nodes'] = [{'title': f"{title} (p. {page})" if title else f"Page {page}", 'node_id': '',
+                          'start_index': page, 'end_index': page} for page in range(start, end + 1)]
+        split += 1
+    return split
+
+
 def _subtree(nodes):
     for node in nodes:
         yield node
@@ -1257,8 +1287,9 @@ class SummaryScheduler:
     def __init__(self, structure, pdf_pages, model=None, small_node_tokens=None,
                  max_intro_pages=SUMMARY_INTRO_MAX_PAGES, concurrency=None,
                  max_words=None, split_shared_pages=False, reasoning_effort=None,
-                 drop_refused_effort=False):
+                 drop_refused_effort=False, max_input_tokens=None):
         self.structure = structure
+        self._max_input_tokens = max_input_tokens
         self._pdf_pages = pdf_pages
         self._split_shared_pages = split_shared_pages
         self._params = {"reasoning_effort": reasoning_effort} if reasoning_effort else {}
@@ -1342,6 +1373,8 @@ class SummaryScheduler:
         text = self._leaf_text(node)
         if count_tokens(text, model=self._model) < self._small_node_tokens:
             return text.strip()
+        if self._max_input_tokens:  # a single page too long for the model: its summary reads what fits
+            text = truncate_to_tokens(text, self._max_input_tokens, model=self._model)
 
         # A node merged from same-page siblings carries a title joined from theirs.
         # This call already has the page text in front of it, so the better title
@@ -1379,9 +1412,15 @@ class SummaryScheduler:
     async def _parent_summary(self, node, prio):
         children = node['nodes']
         intro = get_intro_text(node, self._pdf_pages, max_pages=self._max_intro_pages)
-        listing = json.dumps(
-            [{'title': c.get('title', ''), 'summary': c.get('summary', '')} for c in children],
-            ensure_ascii=False)
+        listing = self._listing(children)
+        budget = self._max_input_tokens
+        if budget:
+            intro = truncate_to_tokens(intro, budget // 2, model=self._model)
+            room = budget - count_tokens(intro, model=self._model)
+            if count_tokens(listing, model=self._model) > room:
+                # many children: each summary shortened to its share of the room
+                words = max(5, int((room / len(children) - 15) / TOKENS_PER_WORD))
+                listing = truncate_to_tokens(self._listing(children, words), room, model=self._model)
         prompt = f"""You are given a section of a document: the text that opens the section (possibly empty) and the titles and summaries of its subsections.
     Your task is to generate a concise description of everything that is covered in the whole section, summarizing all its points without omitting any type of content.
     Keep the description concise and to the point, avoiding unnecessary details, within {self._max_words} words.
@@ -1401,6 +1440,13 @@ class SummaryScheduler:
     Follow strictly the above JSON return format. Do not include any other text!
     """
         return parse_summary(await self._ask(prompt, prio))
+
+    @staticmethod
+    def _listing(children, words=None):
+        def cut(summary):
+            return " ".join(summary.split()[:words]) if words else summary
+        return json.dumps([{'title': c.get('title', ''), 'summary': cut(c.get('summary') or '')}
+                           for c in children], ensure_ascii=False)
 
     async def _visit(self, node, depth):
         await self._mark(node)
@@ -1466,7 +1512,8 @@ class SummaryScheduler:
 async def summarize_tree(structure, pdf_pages, model=None, small_node_tokens=None,
                          max_intro_pages=SUMMARY_INTRO_MAX_PAGES, concurrency=None,
                          max_words=None, split_shared_pages=False,
-                         reasoning_effort=None, drop_refused_effort=False):
+                         reasoning_effort=None, drop_refused_effort=False,
+                         max_input_tokens=None):
     """Bottom-up summaries: leaves from their own pages, parents composed from
     child summaries plus the pages no child covers. A parent's summary describes
     its whole subtree (end_index union semantics). Nodes that already carry a
@@ -1478,7 +1525,9 @@ async def summarize_tree(structure, pdf_pages, model=None, small_node_tokens=Non
     `reasoning_effort` goes with every summary call, over the indexing
     backend's, and with `drop_refused_effort` the calls stop sending it once
     a prompt the server refused with it goes through without it (never on
-    claude-code/, whose effort is checked up front). Model calls
+    claude-code/, whose effort is checked up front); with `max_input_tokens`
+    no call reads more text than that (a leaf's cut at its end, a parent's
+    opening text and child summaries shortened to fit). Model calls
     run deepest node first, both in starting order and in leaving the queue:
     depth counts the calls left on a node's path to the root, its own
     included."""
@@ -1488,7 +1537,8 @@ async def summarize_tree(structure, pdf_pages, model=None, small_node_tokens=Non
                                  concurrency=concurrency, max_words=max_words,
                                  split_shared_pages=split_shared_pages,
                                  reasoning_effort=reasoning_effort,
-                                 drop_refused_effort=drop_refused_effort)
+                                 drop_refused_effort=drop_refused_effort,
+                                 max_input_tokens=max_input_tokens)
     scheduler.mark_final(list(_subtree(structure)))
     return await scheduler.finish()
 

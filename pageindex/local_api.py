@@ -437,9 +437,10 @@ class LocalAPI:
         import asyncio
         from .flash.api import _page_nodes, _summarize
         from .headings import build_headings_structure
-        from .utils import (SUMMARY_MAX_WORDS, create_clean_structure_for_description,
-                            default_summary_reasoning_effort, generate_doc_description,
-                            learn_model_if_effort_dropped, write_node_id)
+        from .utils import (SUMMARY_MAX_INPUT_TOKENS, SUMMARY_MAX_WORDS,
+                            create_clean_structure_for_description, default_summary_reasoning_effort,
+                            generate_doc_description, learn_model_if_effort_dropped,
+                            split_oversized_leaves, write_node_id)
         if extraction is None:
             raise PageIndexAPIError(
                 "Failed to submit document: mode='headings' reads the headings LiteParse finds; configure "
@@ -457,10 +458,15 @@ class LocalAPI:
         backend = "headings"
         if not structure:
             structure, backend = _page_nodes(page_texts), "headings_pages"
+        summary_model = self._summary_model or self._model
+        # A run of pages with no heading inside (a table of figures, a scan) can be longer than the summary
+        # model reads: it is summarized page by page instead of failing the document.
+        split = split_oversized_leaves(structure, page_texts, SUMMARY_MAX_INPUT_TOKENS, model=summary_model)
         extraction.metadata["structure_backend"] = backend
         extraction.metadata["headings"] = {key: value for key, value in report.items() if key != "decisions"}
+        if split:
+            extraction.metadata["headings"]["split_by_page"] = split
         write_node_id(structure)
-        summary_model = self._summary_model or self._model
         from .integrations.claude_agent_sdk import is_claude_code
         if not is_claude_code(summary_model):
             learn_model_if_effort_dropped(summary_model)
@@ -471,7 +477,8 @@ class LocalAPI:
         asyncio.run(_summarize(structure, [(text, 0) for text in page_texts], summary_model,
                                concurrency=self._summary_concurrency,
                                max_words=self._summary_max_words or SUMMARY_MAX_WORDS,
-                               reasoning_effort=effort, drop_refused_effort=defaulted))
+                               reasoning_effort=effort, drop_refused_effort=defaulted,
+                               max_input_tokens=SUMMARY_MAX_INPUT_TOKENS))
         timings["summaries"], tick = perf_counter() - tick, perf_counter()
         description = generate_doc_description(
             create_clean_structure_for_description(structure, top_level_only=True), model=summary_model)

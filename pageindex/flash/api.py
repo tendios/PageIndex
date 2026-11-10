@@ -74,12 +74,13 @@ def _validate_pdf(pdf):
 
 
 async def _summarize(structure, page_list, model, concurrency=None, max_words=None,
-                     reasoning_effort=None, drop_refused_effort=False):
+                     reasoning_effort=None, drop_refused_effort=False, max_input_tokens=None):
     from ..utils import summarize_tree
     await summarize_tree(structure, page_list, model=model, concurrency=concurrency,
                          max_words=max_words, split_shared_pages=True,
                          reasoning_effort=reasoning_effort,
-                         drop_refused_effort=drop_refused_effort)
+                         drop_refused_effort=drop_refused_effort,
+                         max_input_tokens=max_input_tokens)
 
 
 async def _optimize_async(structure, page_texts, do_expand, model, on_final=None,
