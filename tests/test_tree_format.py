@@ -657,6 +657,49 @@ def test_summarize_tree_parent_falls_back_to_its_subsection_titles(monkeypatch):
     assert [n["summary"] for n in utils._subtree(out)] == ["A; B", "ok", "ok"]
 
 
+
+def test_split_oversized_leaves_gives_a_long_leaf_one_child_per_page():
+    pages = ["uno " * 40, "dos " * 40, "tres " * 40, "cuatro " * 5]
+    structure = [{"title": "Tabla", "start_index": 1, "end_index": 3},
+                 {"title": "Corto", "start_index": 4, "end_index": 4}]
+
+    assert utils.split_oversized_leaves(structure, pages, max_tokens=60) == 1
+    assert [(n["title"], n["start_index"], n["end_index"]) for n in utils._subtree(structure)] == [
+        ("Tabla", 1, 3), ("Tabla (p. 1)", 1, 1), ("Tabla (p. 2)", 2, 2), ("Tabla (p. 3)", 3, 3),
+        ("Corto", 4, 4)]
+    assert utils.split_oversized_leaves(structure, pages, max_tokens=60) == 0  # pages are never split
+
+
+def test_split_oversized_leaves_leaves_what_fits_alone():
+    structure = [{"title": "A", "start_index": 1, "end_index": 2}]
+    assert utils.split_oversized_leaves(structure, ["a " * 10, "b " * 10], max_tokens=1000) == 0
+    assert "nodes" not in structure[0]
+
+
+def test_truncate_to_tokens_cuts_at_the_end_to_fit():
+    text = "palabra " * 500
+    cut = utils.truncate_to_tokens(text, 100)
+    assert text.startswith(cut) and utils.count_tokens(cut) <= 100
+    assert utils.truncate_to_tokens("corto", 100) == "corto"
+
+
+def test_summarize_tree_reads_no_more_than_max_input_tokens(monkeypatch):
+    sizes = []
+
+    async def reply(model, prompt, **kw):
+        sizes.append(utils.count_tokens(prompt))
+        return '{"summary": "' + "resumen " * 100 + '"}'
+    monkeypatch.setattr(utils, "llm_acompletion", reply)
+    children = [{"title": f"P{n}", "start_index": n, "end_index": n} for n in range(1, 31)]
+    structure = [{"title": "R", "start_index": 1, "end_index": 30, "nodes": children}]
+    pages = [("cifra 12345 " * 400, 0) for _ in range(30)]
+
+    asyncio.run(utils.summarize_tree(structure, pages, max_input_tokens=1000))
+
+    assert len(sizes) == 31 and max(sizes) < 1000 + 300  # the text, and the prompt's own words
+    assert structure[0]["summary"].startswith("resumen")
+
+
 def test_get_tree_parent_text_shares_its_first_childs_page_unless_an_intro_holds_it(
         tmp_path, monkeypatch):
     pdf = tmp_path / "report.pdf"
