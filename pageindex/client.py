@@ -1739,6 +1739,67 @@ class PageIndexClient:
             raise error
         return answer
 
+    def extract(
+        self,
+        messages: Union[str, list[dict[str, Any]]],
+        output_schema: dict[str, Any],
+        *,
+        doc_id: Optional[Union[str, list[str]]] = None,
+        folder_id: Optional[str] = None,
+        model: Optional[str] = None,
+        instructions: Optional[str] = None,
+        max_turns: Optional[int] = None,
+        max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+        backend: Optional[dict[str, Any]] = None,
+        extra_headers: Optional[dict[str, str]] = None,
+        extra_body: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """
+        Fill a JSON object from the documents. The chat agent runs as
+        ``chat()`` does, with the same tools, until it calls a
+        ``submit_result`` tool whose arguments are ``output_schema``; a call
+        whose data does not match the schema goes back to the model with
+        the errors. Own-model chat only (API models through LiteLLM).
+
+        Args:
+            messages: The request, as a string or a message list.
+            output_schema: The JSON schema the result must match.
+            doc_id, folder_id, model, max_turns, max_tokens,
+            reasoning_effort, backend, extra_headers, extra_body: as in
+                ``chat()``; ``max_tokens`` caps each model call.
+            instructions: Extra system text after the managed prompt.
+
+        Returns:
+            ``{"data", "sources", "usage", "model", "turns",
+            "finish_reason"}``: ``data`` matches ``output_schema``;
+            ``sources`` lists ``{"field", "doc_id", "page"}`` as the model
+            reported them (field is a path in data: ``lots[0].budget``).
+
+        Raises:
+            PageIndexAPIError: an invalid schema (status_code 400), the
+                run reaching ``max_turns`` without a valid submit, or a
+                model backend failure; ``usage`` carries what was spent.
+        """
+        self._require_own_chat("extract()")
+        if isinstance(messages, str):
+            if not messages.strip():
+                raise PageIndexAPIError(
+                    "messages must be a non-empty string or a list of "
+                    "message dicts.")
+            messages = [{"role": "user", "content": messages}]
+        from .local_chat import _refuse_skeleton, run_extract
+        _refuse_skeleton(extra_body)
+        if instructions:
+            messages = [{"role": "system", "content": instructions},
+                        *messages]
+        return run_extract(
+            self, messages, output_schema, doc_id=doc_id,
+            folder_id=folder_id, model=model, max_turns=max_turns,
+            max_tokens=max_tokens, reasoning_effort=reasoning_effort,
+            extra_body=extra_body, extra_headers=extra_headers,
+            backend=backend)
+
     def chat_completions(
         self,
         messages: Union[str, list[dict[str, Any]]],

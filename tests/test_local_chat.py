@@ -7024,3 +7024,132 @@ def test_managed_instructions_drop_blank_system_texts(store_path):
     client = PageIndexLocalClient(storage_path=store_path)
     assert (local_chat._managed_instructions(client, ["", "  ", "X"])
             == local_chat._managed_instructions(client, ["X"]))
+
+
+# ── extract ──
+
+PRICE_SCHEMA = {
+    "type": "object",
+    "properties": {"price": {"type": "number"},
+                   "currency": {"type": "string"}},
+    "required": ["price"],
+}
+
+
+def _recording_settings(fake):
+    seen = []
+    original = fake.get_response
+
+    async def get_response(system_instructions, input, model_settings,
+                           tools, *args, **kwargs):
+        seen.append((model_settings, [t.name for t in tools]))
+        return await original(system_instructions, input, model_settings,
+                              tools, *args, **kwargs)
+
+    fake.get_response = get_response
+    return seen
+
+
+@needs_agents
+def test_extract_end_to_end(client, store_path, fake_model):
+    seed_doc(store_path, "pi-a", "report.pdf")
+    fake = fake_model([
+        [_call_item("get_document", {"doc_name": "report.pdf"})],
+        [_call_item("submit_result", {
+            "data": {"price": 100, "currency": "EUR"},
+            "sources": [{"field": "price", "doc_id": "pi-a", "page": 1},
+                        "not a source"]}, call_id="call_2")],
+    ])
+    seen = _recording_settings(fake)
+    result = client.extract("¿Precio?", PRICE_SCHEMA, doc_id="pi-a",
+                            instructions="Answer in euros.")
+    assert result["data"] == {"price": 100, "currency": "EUR"}
+    assert result["sources"] == [{"field": "price", "doc_id": "pi-a",
+                                  "page": 1}]
+    assert result["turns"] == 2
+    assert result["usage"]["total_tokens"] == 30
+    assert result["finish_reason"] == "stop"
+    # every turn must call a tool, and the submit tool is offered beside
+    # the chat's own
+    assert [s.tool_choice for s, _ in seen] == ["required", "required"]
+    assert "submit_result" in seen[0][1] and "get_document" in seen[0][1]
+    system = fake.instructions[0]
+    assert "call submit_result" in system and "Answer in euros." in system
+    assert system.index("submit_result") < system.index("Answer in euros.")
+
+
+@needs_agents
+def test_extract_returns_schema_errors_to_the_model(client, store_path,
+                                                    fake_model):
+    seed_doc(store_path, "pi-a", "report.pdf")
+    fake = fake_model([
+        [_call_item("submit_result", {"data": {"price": "cien"}})],
+        [_call_item("submit_result", {"data": {"price": 100}},
+                    call_id="call_2")],
+    ])
+    result = client.extract("¿Precio?", PRICE_SCHEMA, doc_id="pi-a")
+    assert result["data"] == {"price": 100} and result["sources"] == []
+    told = json.dumps(fake.inputs[1], default=str)
+    assert "data does not match the schema" in told and "price" in told
+
+
+@needs_agents
+def test_extract_refuses_an_invalid_schema_before_any_call(client, store_path,
+                                                           fake_model):
+    seed_doc(store_path, "pi-a", "report.pdf")
+    fake = fake_model([])
+    with pytest.raises(PageIndexAPIError, match="not a valid JSON schema") \
+            as caught:
+        client.extract("q", {"type": "nope"}, doc_id="pi-a")
+    assert caught.value.status_code == 400 and fake.inputs == []
+    with pytest.raises(PageIndexAPIError, match="JSON schema object"):
+        client.extract("q", ["type"], doc_id="pi-a")
+
+
+@needs_agents
+def test_extract_max_turns_without_a_valid_submit(client, store_path,
+                                                  fake_model):
+    seed_doc(store_path, "pi-a", "report.pdf")
+    fake_model([
+        [_call_item("submit_result", {"data": {}})],
+        [_call_item("submit_result", {"data": {}}, call_id="call_2")],
+    ])
+    with pytest.raises(PageIndexAPIError, match=r"max_turns \(2\)") as caught:
+        client.extract("q", PRICE_SCHEMA, doc_id="pi-a", max_turns=2)
+    assert caught.value.usage["total_tokens"] == 30
+
+
+@needs_agents
+def test_extract_text_ending_is_an_error(client, store_path, fake_model):
+    seed_doc(store_path, "pi-a", "report.pdf")
+    fake = fake_model([[_msg_item("El precio es 100")]])
+    seen = _recording_settings(fake)
+    with pytest.raises(PageIndexAPIError,
+                       match="without calling submit_result") as caught:
+        client.extract("q", PRICE_SCHEMA, doc_id="pi-a",
+                       reasoning_effort="low")
+    # a thinking model chooses its tools: Claude refuses a forced one
+    assert seen[0][0].tool_choice == "auto"
+    assert caught.value.usage["total_tokens"] == 15
+
+
+def test_extract_parameters_keep_root_definitions():
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {"lots": {"type": "array",
+                                "items": {"$ref": "#/$defs/lot"}}},
+        "$defs": {"lot": {"type": "object",
+                          "properties": {"budget": {"type": "number"}}}},
+    }
+    params = local_chat._submit_parameters(schema)
+    assert params["$defs"] == schema["$defs"]
+    assert "$defs" not in params["properties"]["data"]
+    assert "$schema" not in params["properties"]["data"]
+    assert params["required"] == ["data"]
+    from jsonschema import Draft202012Validator
+    bad = {"data": {"lots": [{"budget": "x"}]}}
+    errors = list(Draft202012Validator(params).iter_errors(bad))
+    assert errors and local_chat._error_path(
+        local_chat._schema_validator(schema).iter_errors(bad["data"])
+        .__next__()) == "lots[0].budget"

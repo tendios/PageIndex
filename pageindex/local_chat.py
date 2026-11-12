@@ -1747,6 +1747,203 @@ def run_chat_completions(client, messages, stream: bool = False,
     return _text_only(_stream_sync(agen))
 
 
+SUBMIT_TOOL = "submit_result"
+_EXTRACT_PROMPT = (
+    "Your task is to fill a JSON object from the documents, not to write an "
+    "answer. Search the documents with your tools as you would to answer a "
+    "question, then call " + SUBMIT_TOOL + " once with:\n"
+    "- data: the object, matching its JSON schema. Take every value from the "
+    "documents. When the documents do not state a value, leave an optional "
+    "field out, or use null where the schema allows it; never invent one.\n"
+    "- sources: where you read each value you filled: its field path in data "
+    "(dots and [index], e.g. price or lots[0].budget), the document's doc_id "
+    "and the page number.\n"
+    "If " + SUBMIT_TOOL + " reports errors, fix them and call it again. Do "
+    "not reply with text."
+)
+_SOURCES_SCHEMA = {
+    "type": "array",
+    "description": "Where each filled value was read.",
+    "items": {
+        "type": "object",
+        "properties": {
+            "field": {"type": "string",
+                      "description": "Path of the value in data: dots and "
+                                     "[index], e.g. lots[0].budget."},
+            "doc_id": {"type": "string"},
+            "page": {"type": "integer"},
+        },
+        "required": ["field", "page"],
+    },
+}
+_MAX_REPORTED_ERRORS = 5
+
+
+def _schema_validator(schema):
+    """A validator for the caller's schema, or a 400 naming why it is not
+    one."""
+    if not isinstance(schema, Mapping):
+        raise PageIndexAPIError("output_schema must be a JSON schema object.",
+                                status_code=400)
+    try:
+        from jsonschema import exceptions, validators
+    except ImportError as exc:  # pragma: no cover - a hard dependency
+        raise PageIndexAPIError("extract() needs jsonschema: pip install "
+                                "jsonschema.") from exc
+    cls = validators.validator_for(schema)
+    try:
+        cls.check_schema(schema)
+    except exceptions.SchemaError as exc:
+        raise PageIndexAPIError(
+            f"output_schema is not a valid JSON schema: {exc.message}",
+            status_code=400) from exc
+    return cls(dict(schema))
+
+
+def _submit_parameters(schema: Mapping) -> dict:
+    """The submit tool's parameters: the caller's schema as data, beside the
+    sources. Definitions move to the root, where root-relative $refs
+    (#/$defs/x) still find them."""
+    data = {k: v for k, v in schema.items()
+            if k not in ("$defs", "definitions", "$schema", "$id")}
+    params: dict = {
+        "type": "object",
+        "properties": {"data": data, "sources": _SOURCES_SCHEMA},
+        "required": ["data"],
+    }
+    for key in ("$defs", "definitions"):
+        if key in schema:
+            params[key] = schema[key]
+    return params
+
+
+def _error_path(error) -> str:
+    path = ""
+    for part in error.absolute_path:
+        path += f"[{part}]" if isinstance(part, int) else (
+            f".{part}" if path else str(part))
+    return path or "data"
+
+
+def _submit_tool(schema: Mapping, validator, accepted: dict):
+    """The tool the agent ends with: it checks data against the schema and
+    keeps the first valid call; an invalid one goes back to the model as the
+    tool's result, so it can fix it."""
+    from agents import FunctionTool
+
+    async def submit(_context, arguments: str) -> str:
+        try:
+            payload = json.loads(arguments or "{}")
+        except json.JSONDecodeError as exc:
+            return f"Error: the arguments are not valid JSON ({exc}). Call {SUBMIT_TOOL} again."
+        if not isinstance(payload, dict) or "data" not in payload:
+            return f"Error: send an object with data (and sources). Call {SUBMIT_TOOL} again."
+        errors = sorted(validator.iter_errors(payload["data"]),
+                        key=lambda e: list(e.absolute_path))
+        if errors:
+            lines = [f"- {_error_path(e)}: {e.message}"
+                     for e in errors[:_MAX_REPORTED_ERRORS]]
+            more = len(errors) - len(lines)
+            if more > 0:
+                lines.append(f"- ... and {more} more")
+            return ("Error: data does not match the schema:\n"
+                    + "\n".join(lines)
+                    + f"\nFix it and call {SUBMIT_TOOL} again.")
+        sources = payload.get("sources")
+        accepted["data"] = payload["data"]
+        accepted["sources"] = [
+            s for s in (sources if isinstance(sources, list) else [])
+            if isinstance(s, dict)]
+        return "Accepted."
+
+    return FunctionTool(
+        name=SUBMIT_TOOL,
+        description=("Submit the filled object and where each value was "
+                     "read. Ends the task once data matches the schema."),
+        params_json_schema=_submit_parameters(schema),
+        on_invoke_tool=submit,
+        strict_json_schema=False,
+    )
+
+
+def run_extract(client, messages, output_schema, doc_id=None,
+                model: Optional[str] = None,
+                max_turns: Optional[int] = None,
+                max_tokens: Optional[int] = None,
+                reasoning_effort: Optional[str] = None,
+                extra_body: Optional[dict] = None,
+                extra_headers: Optional[dict] = None,
+                backend: Optional[dict] = None,
+                folder_id: Optional[str] = None) -> dict:
+    """The chat agent, with its tools, ending on a submit tool whose
+    arguments are the caller's schema: returns data (valid against the
+    schema), the model's sources, usage and the model."""
+    _validate_max_turns(max_turns)
+    validator = _schema_validator(output_schema)
+    from .integrations.claude_agent_sdk import is_claude_code
+    if is_claude_code(model or client.chat_model):
+        raise PageIndexAPIError(
+            "extract() runs an API model through LiteLLM; claude-code/ "
+            "models are not supported.", status_code=400)
+    messages = ([{"role": "system", "content": _EXTRACT_PROMPT}]
+                + list(messages))
+    agent, items, model_name, _ = _chat_agent(
+        client, messages, doc_id, model, reasoning_effort=reasoning_effort,
+        extra_body=extra_body, max_tokens=max_tokens, backend=backend,
+        extra_headers=extra_headers, folder_id=folder_id)
+    accepted: dict = {}
+
+    def finish(_context, _results):
+        from agents import ToolsToFinalOutputResult
+        if "data" in accepted:
+            return ToolsToFinalOutputResult(is_final_output=True,
+                                            final_output=accepted)
+        return ToolsToFinalOutputResult(is_final_output=False)
+
+    # Every turn calls a tool, so the run can only end in a valid submit or
+    # at max_turns. Claude refuses a forced tool while thinking: there the
+    # model chooses, and a text ending is an error.
+    thinking = reasoning_effort not in (None, "none")
+    agent = agent.clone(
+        tools=[*agent.tools, _submit_tool(output_schema, validator, accepted)],
+        tool_use_behavior=finish,
+        reset_tool_choice=False,
+        model_settings=dataclasses.replace(
+            agent.model_settings,
+            tool_choice="auto" if thinking else "required"),
+    )
+    recorded: dict = {}
+    _record_chat_finish(agent, recorded)
+    import openai
+    from agents import Runner
+    from agents.exceptions import AgentsException, MaxTurnsExceeded
+    recorder = _usage_recorder()
+    try:
+        result = _run_sync(_run_closing(agent, Runner.run(
+            agent, input=items, hooks=recorder, **_run_kwargs(max_turns))))
+    except (MaxTurnsExceeded, AgentsException, openai.OpenAIError) as exc:
+        raise _with_usage(
+            _translate_run_error(exc, max_turns, "chat", client),
+            _openai_usage(recorder.responses)) from exc
+    usage = _openai_usage(result.raw_responses)
+    if "data" not in accepted:
+        raise _with_usage(PageIndexAPIError(
+            f"The model answered without calling {SUBMIT_TOOL}: "
+            f"{_clip(result.final_output or '')!r}"), usage)
+    return {
+        "data": accepted["data"],
+        "sources": accepted["sources"],
+        "usage": usage,
+        "model": _reported_model(model_name),
+        "turns": len(result.raw_responses),
+        # The last turn is the submit call ("tool_calls"): a finished run is
+        # "stop", unless that turn was cut short.
+        "finish_reason": (recorded.get("finish_reason")
+                          if recorded.get("finish_reason") in _CUT_SHORT
+                          else "stop"),
+    }
+
+
 class _ResponsesEnvelope(ChatObject):
     """The Responses envelope. Its transcript was ``items`` before it became
     ``messages``; the old key still reads it, with a DeprecationWarning, and
