@@ -7731,15 +7731,19 @@ def test_extract_end_to_end(client, store_path, fake_model):
 def test_extract_returns_schema_errors_to_the_model(client, store_path,
                                                     fake_model):
     seed_doc(store_path, "pi-a", "report.pdf")
+    source = {"field": "price", "doc_id": "pi-a", "page": 1}
     fake = fake_model([
-        [_call_item("submit_result", {"data": {"price": "cien"}})],
-        [_call_item("submit_result", {"data": {"price": 100}},
+        [_call_item("submit_result", {"data": {"price": "cien"},
+                                      "sources": [source]})],
+        [_call_item("submit_result", {"data": {"price": 100},
+                                      "sources": [source]},
                     call_id="call_2")],
     ])
     result = client.extract("¿Precio?", PRICE_SCHEMA, doc_id="pi-a")
-    assert result["data"] == {"price": 100} and result["sources"] == []
+    assert result["data"] == {"price": 100} and result["sources"] == [source]
     told = json.dumps(fake.inputs[1], default=str)
     assert "data does not match the schema" in told and "price" in told
+    assert "again with data and sources" in told
 
 
 @needs_agents
@@ -7795,10 +7799,115 @@ def test_extract_parameters_keep_root_definitions():
     assert params["$defs"] == schema["$defs"]
     assert "$defs" not in params["properties"]["data"]
     assert "$schema" not in params["properties"]["data"]
-    assert params["required"] == ["data"]
+    assert params["required"] == ["data", "sources"]
     from jsonschema import Draft202012Validator
-    bad = {"data": {"lots": [{"budget": "x"}]}}
+    assert list(Draft202012Validator(params).iter_errors(
+        {"data": {"lots": []}}))  # sources is required too
+    bad = {"data": {"lots": [{"budget": "x"}]}, "sources": []}
     errors = list(Draft202012Validator(params).iter_errors(bad))
     assert errors and local_chat._error_path(
         local_chat._schema_validator(schema).iter_errors(bad["data"])
         .__next__()) == "lots[0].budget"
+
+
+def _submit(schema, *calls):
+    """The submit tool's answer to each call in turn, and what it kept."""
+    import asyncio
+    accepted: dict = {}
+    tool = local_chat._submit_tool(
+        schema, local_chat._schema_validator(schema), accepted)
+    answers = [asyncio.run(tool.on_invoke_tool(
+        None, c if isinstance(c, str) else json.dumps(c))) for c in calls]
+    return answers, accepted
+
+
+SOURCE = {"field": "price", "doc_id": "pi-a", "page": 3}
+CLOSED_PRICE = {**PRICE_SCHEMA, "additionalProperties": False}
+
+
+@needs_agents
+@pytest.mark.parametrize("arguments", [
+    # data as a JSON string, sources beside it
+    {"data": json.dumps({"price": 100}), "sources": [SOURCE]},
+    # data as a JSON string holding the rest of the arguments too
+    {"data": '{"price": 100}, "sources": ' + json.dumps([SOURCE]) + "}"},
+    # data inside a second data, with the sources
+    {"data": {"data": {"price": 100}, "sources": [SOURCE]}},
+    # data inside a second data, the sources beside it
+    {"data": {"data": {"price": 100}}, "sources": [SOURCE]},
+    # sources inside data
+    {"data": {"price": 100, "sources": [SOURCE]}},
+])
+@pytest.mark.parametrize("schema", [PRICE_SCHEMA, CLOSED_PRICE])
+def test_extract_submit_puts_misplaced_arguments_where_the_tool_takes_them(
+        arguments, schema):
+    answers, accepted = _submit(schema, arguments)
+    assert answers == ["Accepted."]
+    assert accepted == {"data": {"price": 100}, "sources": [SOURCE]}
+
+
+@needs_agents
+def test_extract_submit_leaves_fields_the_schema_asks_for():
+    """No repair where the caller's schema has the field, or where data as
+    sent already matches it."""
+    with_sources = {"type": "object",
+                    "properties": {"price": {"type": "number"},
+                                   "sources": {"type": "array"}}}
+    answers, accepted = _submit(with_sources, {
+        "data": {"price": 100, "sources": ["BOE"]}, "sources": [SOURCE]})
+    assert accepted["data"] == {"price": 100, "sources": ["BOE"]}
+    with_data = {"type": "object",
+                 "properties": {"data": {"type": "object"},
+                                "sources": {"type": "array"}}}
+    answers, accepted = _submit(with_data, {
+        "data": {"data": {"a": 1}, "sources": []}, "sources": [SOURCE]})
+    assert accepted["data"] == {"data": {"a": 1}, "sources": []}
+    text = {"type": "string"}
+    answers, accepted = _submit(text, {"data": '{"price": 100}',
+                                       "sources": [SOURCE]})
+    assert accepted["data"] == '{"price": 100}'
+    # a string that is no JSON stays what it was, and is reported
+    answers, accepted = _submit(PRICE_SCHEMA, {"data": "cien euros",
+                                               "sources": [SOURCE]})
+    assert "data does not match the schema" in answers[0] and not accepted
+
+
+@needs_agents
+def test_extract_submit_asks_once_for_missing_sources():
+    """A valid call without sources goes back once, asking for them; the
+    next one is accepted, with or without them. Data with nothing filled
+    needs none."""
+    answers, accepted = _submit(PRICE_SCHEMA, {"data": {"price": 100}},
+                                {"data": {"price": 100},
+                                 "sources": [SOURCE]})
+    assert answers[0].startswith("Error: sources is missing")
+    assert "submit_result again with data and sources" in answers[0]
+    assert answers[1] == "Accepted." and accepted["sources"] == [SOURCE]
+    answers, accepted = _submit(PRICE_SCHEMA, {"data": {"price": 100}},
+                                {"data": {"price": 100}, "sources": []})
+    assert answers[1] == "Accepted."
+    assert accepted == {"data": {"price": 100}, "sources": []}
+    nothing = {"type": "object",
+               "properties": {"price": {"type": ["number", "null"]}}}
+    answers, accepted = _submit(nothing, {"data": {"price": None}})
+    assert answers == ["Accepted."] and accepted["sources"] == []
+    # an invalid call does not use up the question
+    answers, _ = _submit(PRICE_SCHEMA, {"data": {"price": "cien"}},
+                         {"data": {"price": 100}})
+    assert answers[1].startswith("Error: sources is missing")
+
+
+@needs_agents
+def test_extract_asks_the_model_for_its_sources(client, store_path,
+                                                fake_model):
+    seed_doc(store_path, "pi-a", "report.pdf")
+    fake = fake_model([
+        [_call_item("submit_result", {"data": {"price": 100}})],
+        [_call_item("submit_result", {"data": {"price": 100},
+                                      "sources": [SOURCE]},
+                    call_id="call_2")],
+    ])
+    result = client.extract("¿Precio?", PRICE_SCHEMA, doc_id="pi-a")
+    assert result["data"] == {"price": 100}
+    assert result["sources"] == [SOURCE] and result["turns"] == 2
+    assert "sources is missing" in json.dumps(fake.inputs[1], default=str)

@@ -1945,7 +1945,7 @@ def _submit_parameters(schema: Mapping) -> dict:
     params: dict = {
         "type": "object",
         "properties": {"data": data, "sources": _SOURCES_SCHEMA},
-        "required": ["data"],
+        "required": ["data", "sources"],
     }
     for key in ("$defs", "definitions"):
         if key in schema:
@@ -1961,19 +1961,66 @@ def _error_path(error) -> str:
     return path or "data"
 
 
+def _filled(value) -> bool:
+    """Whether data holds any value read from the documents."""
+    if isinstance(value, Mapping):
+        return any(_filled(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_filled(v) for v in value)
+    return value is not None and value != ""
+
+
+def _as_asked(payload: dict, schema: Mapping, validator) -> dict:
+    """The arguments as the tool takes them, where the model misplaced them:
+    data sent as a JSON string (whole, or as the rest of the arguments),
+    data inside a second data, sources inside data. Only where the caller's
+    schema has no such field and data as sent does not match it."""
+    own = schema.get("properties") or {}
+    data = payload.get("data")
+    if isinstance(data, str) and not validator.is_valid(data):
+        for text, whole in ((data, False), ('{"data": ' + data, True)):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if whole and isinstance(parsed, dict) and "data" in parsed:
+                payload = {**payload, **parsed}
+            elif not whole:
+                payload = {**payload, "data": parsed}
+            break
+    data = payload.get("data")
+    if (isinstance(data, dict) and "data" in data and "data" not in own
+            and set(data) <= {"data", "sources"}
+            and not validator.is_valid(data)):
+        payload = {**payload, "data": data["data"]}
+        if "sources" in data and not isinstance(payload.get("sources"), list):
+            payload["sources"] = data["sources"]
+    data = payload.get("data")
+    if (isinstance(data, dict) and "sources" in data and "sources" not in own
+            and not isinstance(payload.get("sources"), list)):
+        data = dict(data)
+        payload = {**payload, "data": data, "sources": data.pop("sources")}
+    return payload
+
+
 def _submit_tool(schema: Mapping, validator, accepted: dict):
     """The tool the agent ends with: it checks data against the schema and
     keeps the first valid call; an invalid one goes back to the model as the
-    tool's result, so it can fix it."""
+    tool's result, so it can fix it. A valid call without sources goes back
+    once, asking for them."""
     from agents import FunctionTool
+    asked: dict = {}
 
     async def submit(_context, arguments: str) -> str:
         try:
             payload = json.loads(arguments or "{}")
         except json.JSONDecodeError as exc:
-            return f"Error: the arguments are not valid JSON ({exc}). Call {SUBMIT_TOOL} again."
+            return (f"Error: the arguments are not valid JSON ({exc}). Call "
+                    f"{SUBMIT_TOOL} again with data and sources.")
         if not isinstance(payload, dict) or "data" not in payload:
-            return f"Error: send an object with data (and sources). Call {SUBMIT_TOOL} again."
+            return (f"Error: send an object with data and sources. Call "
+                    f"{SUBMIT_TOOL} again.")
+        payload = _as_asked(payload, schema, validator)
         errors = sorted(validator.iter_errors(payload["data"]),
                         key=lambda e: list(e.absolute_path))
         if errors:
@@ -1984,12 +2031,19 @@ def _submit_tool(schema: Mapping, validator, accepted: dict):
                 lines.append(f"- ... and {more} more")
             return ("Error: data does not match the schema:\n"
                     + "\n".join(lines)
-                    + f"\nFix it and call {SUBMIT_TOOL} again.")
+                    + f"\nFix it and call {SUBMIT_TOOL} again with data and "
+                    "sources.")
         sources = payload.get("sources")
+        sources = [s for s in (sources if isinstance(sources, list) else [])
+                   if isinstance(s, dict)]
+        if not sources and _filled(payload["data"]) and not asked:
+            asked["sources"] = True
+            return ("Error: sources is missing. Beside data, list where you "
+                    "read each value you filled: its field path in data, the "
+                    "document's doc_id and the page number. Call "
+                    f"{SUBMIT_TOOL} again with data and sources.")
         accepted["data"] = payload["data"]
-        accepted["sources"] = [
-            s for s in (sources if isinstance(sources, list) else [])
-            if isinstance(s, dict)]
+        accepted["sources"] = sources
         return "Accepted."
 
     return FunctionTool(
