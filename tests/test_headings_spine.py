@@ -241,3 +241,36 @@ def test_a_skipped_number_written_inside_liteparse_tags_is_found():
     cands, _, _ = collect(pages)
     recovered = [c for c in cands if c.reason == "spine:recovered"]
     assert [(c.mark.path, c.text) for c in recovered] == [((1, 2), "1.2. Lugar de entrega de los bienes")]
+
+
+def test_the_cover_is_what_comes_before_the_first_numbered_section_on_the_first_page():
+    """A specification whose «1.» opens on its first page: the title lines above it are the cover, not containers
+    the whole tree would hang from; an unnumbered title after that «1.» on the same page stays a candidate and sits
+    under it. When the first numbered section opens on a later page, the whole first page is the cover, as before."""
+    def tree(nodes):
+        return [(n["title"], tree(n.get("nodes") or [])) for n in nodes]
+
+    pages = [
+        page(1, [("heading", "# PLIEGO DE PRESCRIPCIONES TÉCNICAS"),
+                 ("heading", "## SERVICIO DE LIMPIEZA DE LOS EDIFICIOS MUNICIPALES"),
+                 ("heading", "## 1. OBJETO DEL CONTRATO"), ("paragraph", "Texto del objeto del contrato."),
+                 ("heading", "## Lotes del contrato"), ("paragraph", "Texto de los lotes."),
+                 ("heading", "## 2. ALCANCE DEL SERVICIO"), ("paragraph", "Texto del alcance.")]),
+        page(2, [("heading", "## 3. PLAZO DE EJECUCIÓN"), ("paragraph", "Texto del plazo.")]),
+    ]
+    cands, _, _ = collect(pages)
+    by_text = {c.text: c for c in cands}
+    for title in ("PLIEGO DE PRESCRIPCIONES TÉCNICAS", "SERVICIO DE LIMPIEZA DE LOS EDIFICIOS MUNICIPALES"):
+        assert (by_text[title].decision, by_text[title].reason) == ("body", "cover")
+    assert by_text["Lotes del contrato"].reason != "cover"
+    structure, _ = build_headings_structure(pages, [p["markdown"] for p in pages])
+    assert tree(structure) == [("1. OBJETO DEL CONTRATO", [("Lotes del contrato", [])]),
+                               ("2. ALCANCE DEL SERVICIO", []), ("3. PLAZO DE EJECUCIÓN", [])]
+
+    later = [page(1, [("heading", "# PLIEGO DE PRESCRIPCIONES TÉCNICAS"), ("heading", "## Ayuntamiento de Moralzarzal"),
+                      ("paragraph", "Expediente 12/2026.")]),
+             page(2, [("heading", "## 1. OBJETO DEL CONTRATO"), ("paragraph", "Texto del objeto."),
+                      ("heading", "## 2. ALCANCE DEL SERVICIO"), ("paragraph", "Texto del alcance.")])]
+    cands, _, _ = collect(later)
+    assert {c.text: c.reason for c in cands if c.page == 1} == {"PLIEGO DE PRESCRIPCIONES TÉCNICAS": "cover",
+                                                                "Ayuntamiento de Moralzarzal": "cover"}

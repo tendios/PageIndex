@@ -643,9 +643,10 @@ def collect(pages: list[dict[str, Any]], layout_structure: Optional[list[dict]] 
             c.index = i
     # The cover: unnumbered lines of the first page before the first numbered section are the document's title.
     first = next((c for c in kept if c.decision == "heading" and c.mark is not None), None)
-    if first is not None and first.page > 1:
+    if first is not None:
         for c in kept:
-            if c.page == 1 and c.decision is None and c.mark is None and "toc" not in c.sources:
+            if c.page == 1 and (c.page, c.order) < (first.page, first.order) and c.decision is None \
+                    and c.mark is None and "toc" not in c.sources:
                 c.decision, c.reason = "body", "cover"
     # Containers: an unnumbered heading the reader flagged that opens a sequence right below it («CUADRO DE
     # CARACTERÍSTICAS DEL CONTRATO» before its «1.»).
