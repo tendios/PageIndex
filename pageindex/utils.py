@@ -1208,12 +1208,18 @@ _INLINE_TAGS = re.compile(r"</?(?:u|sup|sub|s|strike|del|ins|mark|small|b|i|em|s
 _STRIKE_MARKS = re.compile(r"~~(?=\S)|(?<=\S)~~")
 
 
+def drop_inline_marks(text):
+    """strip_inline_marks keeping the text's lines and spacing: what a page's
+    markdown reads as without the tags, line by line."""
+    text = _INLINE_TAGS.sub(lambda m: " " if m.group().startswith("<br") else "", text or "")
+    return _STRIKE_MARKS.sub("", text)
+
+
 def strip_inline_marks(text):
     """The text without its inline formatting: «<u>CLÁUSULA 5. OBJETO</u>» reads
     «CLÁUSULA 5. OBJETO», «m<sup>3</sup>» reads «m3». A tag goes and its text
     stays, a line break is a space, and runs of whitespace become one."""
-    text = _INLINE_TAGS.sub(lambda m: " " if m.group().startswith("<br") else "", text or "")
-    return " ".join(_STRIKE_MARKS.sub("", text).split())
+    return " ".join(drop_inline_marks(text).split())
 
 
 INTRO_SUFFIX = " (intro)"

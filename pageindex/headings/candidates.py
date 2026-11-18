@@ -10,6 +10,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
+from ..utils import strip_inline_marks
+
 NUMBERED = re.compile(r"^(?P<marker>\d{1,2}(?:\.\d{1,2}){0,3}|[IVX]{1,5})\s*[.\-–)]*\s+(?=\S)")
 KEYWORD = re.compile(
     r"^(?P<word>CL[ÀA]USULA|CLÁUSULA|ARTICLE|ART[IÍ]CULO|ANNEX(?:O)?|ANEXO|CAP[IÍ]TOL|CAPÍTULO|T[IÍ]TOL|TÍTULO|"
@@ -72,7 +74,9 @@ class Candidate:
 
 
 def norm(text: Optional[str]) -> str:
-    text = unicodedata.normalize("NFKD", text or "")
+    """The text compared: LiteParse's inline tags dropped (their text stays), no accents, lowercase, letters and
+    digits only."""
+    text = unicodedata.normalize("NFKD", strip_inline_marks(text))
     text = "".join(c for c in text if not unicodedata.combining(c)).lower()
     text = re.sub(r"^#+\s*", "", text)
     text = re.sub(r"[^a-z0-9 ]+", " ", text)
@@ -170,7 +174,7 @@ def _lines_of(pages: list[dict[str, Any]]) -> list[Candidate]:
             lines = [text.split("\n")[0].strip()] if kind != "page" else [l.strip() for l in text.split("\n") if l.strip()]
             for sub, first in enumerate(lines):
                 md = len(re.match(r"^(#*)", first).group(1))
-                clean = re.sub(r"^#+\s*", "", first).strip()
+                clean = strip_inline_marks(re.sub(r"^#+\s*", "", first))
                 if kind == "list_item":
                     clean = re.sub(r"^[-*•]\s+", "", clean)
                 bold = "**" in clean or "__" in clean
@@ -206,9 +210,9 @@ def _table_row_candidates(text: str, page_no: int, order: int, first_index: int)
         cells = [c for c in cells if c]
         if not cells:
             continue
-        title = cells[0]
+        title = strip_inline_marks(cells[0])
         if re.fullmatch(r"[0-9]{1,2}(?:\.[0-9]{1,2}){0,3}\.?|[A-Z](?:\.[0-9]{1,2}){0,2}\.?", title) and len(cells) > 1:
-            title = f"{title} {cells[1]}"
+            title = f"{title} {strip_inline_marks(cells[1])}"
         bold = "**" in title
         title = re.sub(r"(\*{1,3}|_{2,3})(?=\S)|(?<=\S)(\*{1,3}|_{2,3})", "", title).strip()
         marker, numbered, keyword = marker_of(title)

@@ -11,7 +11,7 @@ import re
 from collections import Counter
 from typing import Any, Optional
 
-from ..utils import strip_inline_marks
+from ..utils import drop_inline_marks, strip_inline_marks
 from .candidates import (LETTER_ITEM, MAX_TEXT, Candidate, _carries_page_number, _closest, _flatten,
                          _located_index_entries, _order_in_page, _snippet, is_repeated, masked, norm, repeated_texts,
                          similar, strip_num, tableish)
@@ -41,8 +41,11 @@ _BOLD_MARKS = re.compile(r"(\*{1,3}|_{2,3})(?=\S)|(?<=\S)(\*{1,3}|_{2,3})")
 
 
 def _clean(text: str) -> tuple[str, bool]:
+    """A line as the rules read it, and whether it is bold: no heading or bold marks, and none of the inline tags
+    LiteParse writes (strip_inline_marks): «2. <u>**Règim jurídic**</u>» reads «2. Règim jurídic», bold. An underline
+    is no bold: LiteParse underlines links and words inside a sentence as well as titles."""
     bold = "**" in text or "__" in text
-    return _BOLD_MARKS.sub("", re.sub(r"^#+\s*", "", text)).strip(), bold
+    return _BOLD_MARKS.sub("", strip_inline_marks(re.sub(r"^#+\s*", "", text))).strip(), bold
 
 
 def _font(page: dict[str, Any], block: dict[str, Any]) -> tuple[Optional[float], bool]:
@@ -199,7 +202,7 @@ def lines_of(pages: list[dict[str, Any]]) -> list[Candidate]:
                     heading_block = n == 0 and (kind == "heading" or md > 0)
                     if n == 0 and not heading_block and not parse(piece) and not (bold or font_bold) and kind != "page":
                         continue
-                    spatial_row = kind == "page" and bool(re.match(r"^\s*\d{1,2}\s+[A-ZÀ-ÚÑÇ]{3}", line))
+                    spatial_row = kind == "page" and bool(re.match(r"^\d{1,2}\s+[A-ZÀ-ÚÑÇ]{3}", strip_inline_marks(line)))
                     if kind == "page" and not parse(piece, bare=spatial_row) and not _title_like(piece):
                         continue  # a wrapped line of running text on a spatial page: never a title, never asked
                     if n > 0 and not parse(piece):
@@ -491,8 +494,9 @@ def _advance(state: dict[str, list], m: Marker, seq: str) -> None:
 def ranks(headings: list[Candidate]) -> None:
     """Each heading's rank in the document's hierarchy: grouping keywords in their own order («Título» over
     «Capítulo» over «Sección»), roman chapters and annexes at the top, then clauses («Primera», «Cláusula 3», «3»),
-    their decimal sub-sections, and an unnumbered title one rank under the section it sits in. Ranks are compacted
-    to the ones the document uses."""
+    their decimal sub-sections and their own numbered sections («1.», «2.» inside «Clàusula 20», and a «1.1» below
+    that «1.»), and an unnumbered title one rank under the section it sits in. Ranks are compacted to the ones the
+    document uses."""
     from .numbering import keyword_rank
     families = {c.mark.family for c in headings if c.mark}
     first_clause = next((k for k, c in enumerate(headings) if c.mark and c.mark.family in CLAUSE_FAMILIES + ("decimal",)),
@@ -506,8 +510,11 @@ def ranks(headings: list[Candidate]) -> None:
     clause_rank = len(group_ranks) if group_ranks else (1 if "roman" in families else 1)
     if "roman" in families and group_ranks:
         clause_rank = len(group_ranks)
+    item = None  # the number of the clause's own numbered section the decimals below continue («1.» → «1.1»)
     for k, c in enumerate(headings):
         m = c.mark
+        if m and m.family in TOP_FAMILIES + CLAUSE_FAMILIES:
+            item = None
         if m and m.family == "chapter":
             c.rank = depth_of_group[keyword_rank(m.raw)]
         elif m and m.family == "annex":
@@ -516,7 +523,15 @@ def ranks(headings: list[Candidate]) -> None:
             c.rank = 0 if roman_top else None
         elif m and m.family in CLAUSE_FAMILIES:
             c.rank = clause_rank
+        elif m and c.seq == "clause_item":
+            # «Clàusula 1» then «1. Objecte del contracte», «2. Règim jurídic»: the spine read them as the clause's
+            # own numbered sections (decide), so they sit under it, not beside it as a first-level «1.» would
+            c.rank, item = clause_rank + 1, m.path[0]
+        elif m and m.family == "decimal" and len(m.path) > 1 and m.path[0] == item:
+            c.rank = clause_rank + len(m.path)  # «1.1» under that «1.»
         elif m and m.family in ("decimal", "letter", "paren"):
+            if len(m.path) == 1:
+                item = None
             c.rank = clause_rank - 1 + len(m.path) if has_top else len(m.path)
         else:
             nxt = next((h for h in headings[k + 1:k + 3] if h.mark), None)
@@ -568,10 +583,10 @@ def build(headings: list[Candidate], total_pages: int) -> list[dict[str, Any]]:
 
 def _title(c: Candidate) -> str:
     """The heading as it reads, cut where a numbered paragraph's body starts: «9.2 La capacitat d'obrar de les
-    empreses…» keeps its first clause, not the paragraph. LiteParse's inline formatting goes and its text stays
-    («<u>CLÁUSULA 5. OBJETO</u>» reads «CLÁUSULA 5. OBJETO», «m<sup>3</sup>» «m3»): only the title, the candidate
-    keeps the text the rules read, and the page markdown and blocks stay as LiteParse wrote them. What matches a
-    title against its page (tree_optimize.normalize) drops the tags on both sides."""
+    empreses…» keeps its first clause, not the paragraph. LiteParse's inline formatting is gone and its text stays
+    («<u>CLÁUSULA 5. OBJETO</u>» reads «CLÁUSULA 5. OBJETO», «m<sup>3</sup>» «m3»), as the rules read the line
+    (_clean); a title from the layout or the index never had any. The page markdown and blocks stay as LiteParse
+    wrote them: what matches a title against its page (tree_optimize.normalize) drops the tags on both sides."""
     text = strip_inline_marks(c.text) or c.text
     if len(text) <= 120:
         return text
@@ -686,7 +701,8 @@ def recover_gaps(cands: list[Candidate], pages: list[dict[str, Any]]) -> list[Ca
     added as a heading when it is found once."""
     accepted = [c for c in cands if c.decision == "heading" and c.mark and c.mark.family in ("decimal", "letter")]
     added: list[Candidate] = []
-    texts = {int(p.get("page_index") or 0): p.get("markdown") or "" for p in pages}
+    # the page as the rules read its lines: without LiteParse's inline tags («<u>8.4 Garanties</u>»)
+    texts = {int(p.get("page_index") or 0): drop_inline_marks(p.get("markdown") or "") for p in pages}
     by_family: dict[str, list[Candidate]] = {}
     for c in accepted:
         by_family.setdefault(c.mark.family, []).append(c)

@@ -187,3 +187,57 @@ def test_titles_drop_liteparse_inline_tags_and_the_page_text_keeps_them():
     own = leaf_own_text(structure, structure[1], [(t, 0) for t in texts])
     assert "## <u>**CLÁUSULA 1. OBJETO DEL CONTRATO**</u>" in own and "20 m<sup>3</sup>" in own
     assert "Texto que sigue de la cláusula primera." in own and "CLÁUSULA 2" not in own
+
+
+def test_a_line_that_opens_with_liteparse_tags_keeps_its_numbering_its_bold_and_its_level():
+    """«<u>**Clàusula 1. …**</u>», «2. <u>**Règim jurídic**</u> **El contracte…**», «… m<sup>3</sup>»: the rules read
+    the line without the tags, so the numbering is read as if they weren't there, the bold inside them still counts,
+    and an underline alone is no bold. The clause's own numbered sections («1.», «2.» inside «Clàusula 1») sit under
+    it, and a «1.1» below that «1.»."""
+    from pageindex.headings import collect as first_reading
+
+    pages = [
+        page(1, [("heading", "## <u>**Clàusula 1. Objecte i règim jurídic del contracte**</u>"),
+                 ("heading", "## 1. <u>**Objecte del contracte**</u>"), ("paragraph", "Text de l'objecte."),
+                 ("heading", "## 2. <u>**Règim jurídic**</u> **El contracte es tipifica com a contracte de serveis.**"),
+                 ("paragraph", "<u>Justificació:</u> Aquest criteri es justifica per la disponibilitat d'hores.")]),
+        page(2, [("heading", "## <u>**Clàusula 2. Preu per m<sup>3</sup>**</u>"), ("paragraph", "Text del preu.")]),
+        page(3, [("heading", "## Clàusula 3. Condicions especials d'execució"),
+                 ("heading", "## 1. <u>**Condicions especials**</u>"), ("paragraph", "Text."),
+                 ("heading", "## 1.1 <u>De caràcter social</u>"), ("paragraph", "Text."),
+                 ("heading", "## 2. <u>**Condicions generals**</u>"), ("paragraph", "Text.")]),
+    ]
+    cands, _, _ = collect(pages)
+    by_text = {c.text: c for c in cands}
+    clause = by_text["Clàusula 1. Objecte i règim jurídic del contracte"]
+    assert (clause.mark.family, clause.mark.path, clause.bold) == ("clause", (1,), True)
+    section = by_text["2. Règim jurídic El contracte es tipifica com a contracte de serveis."]
+    assert (section.mark.family, section.mark.path, section.seq, section.bold) == ("decimal", (2,), "clause_item", True)
+    assert by_text["Clàusula 2. Preu per m3"].mark.path == (2,)
+    assert not any(c.text.startswith("Justificació") for c in cands)  # underlined, not bold: not a candidate
+
+    structure, _ = build_headings_structure(pages, [p["markdown"] for p in pages])
+
+    def tree(nodes):
+        return [(n["title"], tree(n.get("nodes") or [])) for n in nodes]
+    assert tree(structure) == [
+        ("Clàusula 1. Objecte i règim jurídic del contracte", [
+            ("1. Objecte del contracte", []),
+            ("2. Règim jurídic El contracte es tipifica com a contracte de serveis.", [])]),
+        ("Clàusula 2. Preu per m3", []),
+        ("Clàusula 3. Condicions especials d'execució", [
+            ("1. Condicions especials", [("1.1 De caràcter social", [])]),
+            ("2. Condicions generals", [])])]
+
+    first, _ = first_reading(pages)  # the first reading reads the same text
+    assert next(c for c in first if c.text.startswith("Clàusula 1")).marker == "clausula 1"
+
+
+def test_a_skipped_number_written_inside_liteparse_tags_is_found():
+    pages = [page(1, [("heading", "# 1. EJECUCIÓN"), ("paragraph", "1.1. Plazo de ejecución del servicio"),
+                      ("paragraph", "Texto del plazo, sin más."), ("paragraph", "1.3. Responsable del contrato")])]
+    pages[0]["markdown"] = ("# 1. EJECUCIÓN\n\n1.1. Plazo de ejecución del servicio\n\nTexto del plazo, sin más.\n"
+                            "<u>**1.2. Lugar de entrega**</u> de los bienes\n\n1.3. Responsable del contrato")
+    cands, _, _ = collect(pages)
+    recovered = [c for c in cands if c.reason == "spine:recovered"]
+    assert [(c.mark.path, c.text) for c in recovered] == [((1, 2), "1.2. Lugar de entrega de los bienes")]
