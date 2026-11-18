@@ -32,7 +32,7 @@
 Este fork parte de [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) `v0.6.0` y se publica con etiquetas `v<upstream>-tendios.<n>` (versión del paquete `<upstream>+tendios.<n>`); fija una etiqueta, nunca `main`:
 
 ```bash
-pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.6.0-tendios.2"
+pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.6.0-tendios.3"
 ```
 
 ### Diferencias con upstream
@@ -52,7 +52,7 @@ Las extensiones de indexado se activan en modo local; el modo cloud conserva su 
 Instalación de la versión del fork con LiteParse:
 
 ```bash
-pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.6.0-tendios.2"
+pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.6.0-tendios.3"
 ```
 
 Para desarrollar desde este checkout:
@@ -143,8 +143,12 @@ Cómo se decide cada línea:
   primer nivel que no forma una secuencia completa, se le pregunta frente al resto del índice y se quita si es
   contenido con 0,85 (`heading_judge={"verify": False}` lo desactiva). `"images": True` le envía además un recorte de
   la página con la línea.
+- **Portada**: las líneas sin número de la primera página que van antes de la primera sección numerada son el título
+  del documento, no nodos (si esa sección empieza en otra página, toda la primera página).
 - **Niveles**: por familia (Libro > Título/Parte > Capítulo > Sección > cláusula > subapartados decimales), con los
-  contenedores sin número («CUADRO RESUMEN», «QUADRE DE CARACTERÍSTIQUES») sobre lo que abren.
+  contenedores sin número («CUADRO RESUMEN», «QUADRE DE CARACTERÍSTIQUES») sobre lo que abren. Los «1.», «2.» que una
+  cláusula numera de nuevo («1.» dentro de «Clàusula 1») van un nivel por debajo de ella, y un «1.1» que sigue a ese
+  «1.», por debajo de él. Las reglas leen las líneas sin las etiquetas de LiteParse (`<u>`, `<sup>`, `<sub>`, `~~`).
 
 Medido en 14 pliegos reales (664 páginas, castellano y catalán, PCAP, PPT y cuadros resumen; 1.232 títulos de
 referencia anotados por Claude Opus 5.5 con tres muestras y adjudicación de los desacuerdos):
@@ -153,8 +157,8 @@ referencia anotados por Claude Opus 5.5 con tres muestras y adjudicación de los
 | --- | --- | --- | --- | --- |
 | `0.5.0-tendios.9`, con Jev | 66,4 % | 79,5 % | 72,4 % | 59,9 % |
 | `0.5.1-tendios.2`, con Jev | 89,0 % | 90,4 % | 89,7 % | 83,1 % |
-| esta versión, solo reglas | 91,7 % | 89,0 % | 90,3 % | 80,4 % |
-| esta versión, Jev con revisión final | 90,1 % | 91,2 % | 90,6 % | 82,8 % |
+| esta versión, solo reglas | 91,7 % | 89,0 % | 90,3 % | 81,9 % |
+| esta versión, Jev con revisión final | 90,7 % | 91,3 % | 91,0 % | 83,5 % |
 
 Los modos de la librería con modelo, sobre el mismo corpus: `flash` (maquetación y optimizador con Haiku 5.5) 39,8 %
 de F1; `standard` (el modelo escribe el índice) entre 57 y 79 % en los seis documentos medidos, con 70-190 s por
