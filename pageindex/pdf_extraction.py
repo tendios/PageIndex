@@ -20,6 +20,9 @@ class PDFExtraction:
     metadata: dict
     # Seconds per indexing stage, for the caller's log; never stored with the document.
     timings: dict = field(default_factory=dict)
+    # LiteParse's own result of this read, for the caller (submit_document(return_liteparse=True)); never stored
+    # with the document. See extract_liteparse.
+    liteparse: dict | None = None
 
     @property
     def texts(self) -> list[str]:
@@ -88,6 +91,12 @@ def _swallowing_table(block: dict, width: float, height: float) -> bool:
     return len(rows) <= 4 and area >= 0.5 and longest >= 1200
 
 
+# Page fields LiteParse reads for the caller's copy of the result (PDFExtraction.liteparse) that a stored page's
+# layout keeps empty (None, as LiteParse leaves them when it does not read them): the index does not use them, and
+# they would only make pages.json larger.
+_CALLER_ONLY_FIELDS = ("annotations", "form_fields", "structure_tree", "complexity")
+
+
 def _page_record(page: dict, conf: dict, routed: bool) -> dict:
     number, width, height = page["page_num"], page["width"], page["height"]
     if width <= 0 or height <= 0:
@@ -136,7 +145,7 @@ def _page_record(page: dict, conf: dict, routed: bool) -> dict:
                            "text_format": "spatial" if use_spatial else "blocks"},
             "layout": {"coordinate_system": {"origin": "top-left", "units": "pt",
                                                "dpi": 72, "space": "displayed_page"},
-                       **page}}
+                       **{key: None if key in _CALLER_ONLY_FIELDS else value for key, value in page.items()}}}
 
 
 def _inspector_headings(inspector, data: bytes, count: int) -> list[list[dict]]:
@@ -204,6 +213,20 @@ def _tagged_headings(parser_class, data: bytes, count: int) -> list[list[dict]]:
 
 
 def extract_liteparse(file_path: str, config: str | Mapping) -> PDFExtraction:
+    """Read the PDF with LiteParse, OCR only on the pages pdf-inspector selects, into the pages the index stores.
+
+    The read also asks LiteParse for links, annotations, form fields, the structure tree, XFA packets, the document's
+    metadata and each page's complexity: none of them changes the text or the blocks. The stored pages keep the
+    per-page ones empty (_CALLER_ONLY_FIELDS); they are in `liteparse`, LiteParse's own result for the caller:
+
+    - document: the full pass with the OCR pass's pages in place of the routed ones (as LiteParse returns a
+      ParseResult, through dataclasses.asdict), its document-level fields (doc_meta, xfa_packets, form_type, creator,
+      producer...) from the full pass and `text` joined again from the pages when an OCR pass replaced some;
+    - version, ocr_mode, ocr_language, ocr_backend, ocr_pages (the physical pages read with OCR);
+    - inspection: pdf-inspector's answer (version, pdf_type, confidence, page_count, pages_needing_ocr,
+      ocr_reasons_by_page, has_encoding_issues, processing_time_ms), None unless ocr_mode is auto;
+    - passes (ocr_enabled, target_pages, seconds) and seconds, the whole read up to the merged result.
+    """
     conf = parser_config(config)
     try:
         from liteparse import LiteParse
@@ -212,14 +235,18 @@ def extract_liteparse(file_path: str, config: str | Mapping) -> PDFExtraction:
         raise ImportError('LiteParse requires the optional extra: pip install "pageindex[liteparse]"') from exc
     started = perf_counter()
     data = Path(file_path).read_bytes()
-    mode, routed, inspection = conf["ocr_mode"], [], None
+    mode, routed, inspection, detection = conf["ocr_mode"], [], None, None
     if mode == "auto":
         detected = pdf_inspector.detect_pdf_bytes(data)
         routed = sorted(set(detected.pages_needing_ocr))
+        reasons = [{"page": r.page, "reasons": list(r.reasons)} for r in detected.ocr_reasons_by_page]
         inspection = {"version": version("pdf-inspector"), "page_count": detected.page_count,
-                      "pdf_type": detected.pdf_type,
-                      "ocr_reasons_by_page": [{"page": r.page, "reasons": list(r.reasons)}
-                                              for r in detected.ocr_reasons_by_page]}
+                      "pdf_type": detected.pdf_type, "ocr_reasons_by_page": reasons}
+        detection = {"version": inspection["version"], "pdf_type": detected.pdf_type,
+                     "confidence": detected.confidence, "page_count": detected.page_count,
+                     "pages_needing_ocr": routed, "ocr_reasons_by_page": reasons,
+                     "has_encoding_issues": detected.has_encoding_issues,
+                     "processing_time_ms": detected.processing_time_ms}
     passes = []
 
     def parse(ocr: bool, targets: list[int] | None = None) -> dict:
@@ -230,6 +257,11 @@ def extract_liteparse(file_path: str, config: str | Mapping) -> PDFExtraction:
                            extract_blocks=True, emit_word_boxes=True,
                            extract_images=False, extract_screenshots=False,
                            extract_content_bounds=True, preserve_very_small_text=True,
+                           # For the caller's copy of the result only: they leave the text and the blocks as
+                           # they are. Not extract_text_metadata: it splits the text items and changes the blocks.
+                           extract_links=True, extract_annotations=True, extract_form_fields=True,
+                           extract_structure_tree=True, extract_xfa_packets=True,
+                           extract_document_metadata=True, include_complexity=True,
                            continue_on_page_error=False, ocr_failure_fatal=True, quiet=True)
         tick = perf_counter()
         result = asdict(parser.parse(data))
@@ -251,12 +283,19 @@ def extract_liteparse(file_path: str, config: str | Mapping) -> PDFExtraction:
         raise ValueError("LiteParse and pdf-inspector disagree on the physical page count")
     if not set(routed) <= set(by_page):
         raise ValueError("pdf-inspector selected pages outside the PDF")
+    document = result
     if routed and not all_ocr:
         targeted = parse(True, routed)
         replacement = {page["page_num"]: page for page in targeted["pages"]}
         if targeted["total_pages"] != count or set(replacement) != set(routed) or len(replacement) != len(targeted["pages"]):
             raise ValueError("LiteParse OCR pass did not return exactly the requested physical pages")
         by_page.update(replacement)
+        # As rag's liteparse_pipeline merges its two passes: the full pass's fields, the pages in their physical
+        # order with the OCR ones in place, the text joined again from them, the page errors of both.
+        document = {**result, "pages": [by_page[n] for n in range(1, count + 1)],
+                    "page_errors": [*result.get("page_errors", []), *targeted.get("page_errors", [])]}
+        document["text"] = "\n\n".join(str(page.get("text") or "") for page in document["pages"])
+    read_seconds = perf_counter() - started
     pages = [_page_record(by_page[n], conf, n in routed) for n in range(1, count + 1)]
     for record, heads in zip(pages, _tagged_headings(LiteParse, data, count)):
         if heads and record["page_index"] not in routed:
@@ -264,12 +303,15 @@ def extract_liteparse(file_path: str, config: str | Mapping) -> PDFExtraction:
     for record, heads in zip(pages, _inspector_headings(pdf_inspector, data, count)):
         if heads and record["page_index"] not in routed:
             record["inspector_headings"] = heads
-    return PDFExtraction(pages, {"parser": "liteparse", "version": version("liteparse"),
-                                "ocr_mode": mode, "ocr_language": conf["ocr_language"],
-                                "ocr_backend": "http" if conf.get("ocr_server_url") else "tesseract",
-                                "ocr_pages": routed, "inspection": inspection,
-                                "ocr_empty_pages": [n for n in routed if not (by_page[n].get("text") or "").strip()],
-                                "passes": passes, "seconds": perf_counter() - started})
+    metadata = {"parser": "liteparse", "version": version("liteparse"),
+                "ocr_mode": mode, "ocr_language": conf["ocr_language"],
+                "ocr_backend": "http" if conf.get("ocr_server_url") else "tesseract",
+                "ocr_pages": routed, "inspection": inspection,
+                "ocr_empty_pages": [n for n in routed if not (by_page[n].get("text") or "").strip()],
+                "passes": passes, "seconds": perf_counter() - started}
+    liteparse = {key: metadata[key] for key in ("version", "ocr_mode", "ocr_language", "ocr_backend", "ocr_pages")}
+    liteparse.update(inspection=detection, passes=[dict(p) for p in passes], seconds=read_seconds, document=document)
+    return PDFExtraction(pages, metadata, liteparse=liteparse)
 
 
 def locate_text(pages: list[dict], quote: str) -> list[dict]:

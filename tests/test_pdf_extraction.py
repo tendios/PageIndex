@@ -24,6 +24,8 @@ class Result:
     pages: list
     total_pages: int = 3
     page_errors: list = field(default_factory=list)
+    text: str = ""
+    doc_meta: dict | None = None
 
 
 def fake_parser(monkeypatch, results, routed=(2,)):
@@ -31,7 +33,7 @@ def fake_parser(monkeypatch, results, routed=(2,)):
 
     class Parser:
         def __init__(self, **kwargs):
-            self.tags = bool(kwargs.get("extract_structure_tree"))
+            self.tags = bool(kwargs.get("extract_text_metadata"))
             if not self.tags:  # the light pass that reads a tagged PDF's headings is not an extraction pass
                 calls.append(kwargs)
 
@@ -45,8 +47,9 @@ def fake_parser(monkeypatch, results, routed=(2,)):
 
     monkeypatch.setitem(sys.modules, "liteparse", SimpleNamespace(LiteParse=Parser))
     monkeypatch.setitem(sys.modules, "pdf_inspector", SimpleNamespace(
-        detect_pdf_bytes=lambda _: SimpleNamespace(pages_needing_ocr=routed, page_count=3,
-                                                   pdf_type="mixed", ocr_reasons_by_page=[])))
+        detect_pdf_bytes=lambda _: SimpleNamespace(
+            pages_needing_ocr=routed, page_count=3, pdf_type="mixed", confidence=0.9, has_encoding_issues=False,
+            processing_time_ms=1.5, ocr_reasons_by_page=[SimpleNamespace(page=n, reasons=["no_text"]) for n in routed])))
     monkeypatch.setattr("pageindex.pdf_extraction.version", lambda _: "test")
     return calls
 
@@ -66,6 +69,44 @@ def test_targeted_ocr_keeps_physical_pages_and_geometry(tmp_path, monkeypatch):
     json.dumps(result.pages, allow_nan=False)
 
 
+BLOCK_NEUTRAL = ("extract_links", "extract_annotations", "extract_form_fields", "extract_structure_tree",
+                 "extract_xfa_packets", "extract_document_metadata", "include_complexity")
+
+
+def test_both_passes_read_what_leaves_the_blocks_alone_and_the_caller_gets_liteparses_result(tmp_path, monkeypatch):
+    path = tmp_path / "mixed.pdf"
+    path.write_bytes(b"fixture")
+    full = [page(1), page(2, ""), page(3)]
+    for p in full:
+        p.update(annotations=[{"subtype": "Link", "uri": "https://example.org"}], form_fields=[],
+                 structure_tree={"roots": [{"type": "P"}]}, complexity={"is_complex": False})
+    ocr = {**page(2, "recovered"), "annotations": [], "form_fields": [], "structure_tree": None, "complexity": None}
+    calls = fake_parser(monkeypatch, [Result(full, text="native\n\n\n\nnative", doc_meta={"file_version": 17}),
+                                      Result([ocr], doc_meta={"file_version": 0})])
+    result = extract_liteparse(str(path), "liteparse")
+    for call in calls:
+        assert all(call[option] is True for option in BLOCK_NEUTRAL)
+        assert "extract_text_metadata" not in call  # it splits the text items: other blocks
+    read = result.liteparse
+    document = read.pop("document")
+    assert read == {"version": "test", "ocr_mode": "auto", "ocr_language": "spa", "ocr_backend": "tesseract",
+                    "ocr_pages": [2], "passes": [{k: v for k, v in p.items()} for p in result.metadata["passes"]],
+                    "seconds": pytest.approx(read["seconds"]),
+                    "inspection": {"version": "test", "pdf_type": "mixed", "confidence": 0.9, "page_count": 3,
+                                   "pages_needing_ocr": [2], "has_encoding_issues": False, "processing_time_ms": 1.5,
+                                   "ocr_reasons_by_page": [{"page": 2, "reasons": ["no_text"]}]}}
+    # The full pass with the OCR page in its place, its own document-level fields, the text joined again.
+    assert [p["page_num"] for p in document["pages"]] == [1, 2, 3]
+    assert document["pages"][1] == ocr and document["pages"][0] == full[0]
+    assert document["doc_meta"] == {"file_version": 17} and document["total_pages"] == 3
+    assert document["text"] == "native\n\nrecovered\n\nnative" and document["page_errors"] == []
+    # The index stores the pages as before: the fields read for the caller empty, as when they were not read.
+    for stored in result.pages:
+        assert [stored["layout"][k] for k in ("annotations", "form_fields", "structure_tree", "complexity")] == [None] * 4
+        assert stored["layout"]["blocks"] and stored["layout"]["text_items"]
+    json.dumps(document, allow_nan=False)
+
+
 @pytest.mark.parametrize("routed", [(), (1, 2, 3)])
 def test_all_native_or_all_ocr_needs_only_one_pass(tmp_path, monkeypatch, routed):
     path = tmp_path / "doc.pdf"
@@ -75,6 +116,9 @@ def test_all_native_or_all_ocr_needs_only_one_pass(tmp_path, monkeypatch, routed
     assert len(calls) == 1
     assert calls[0]["ocr_enabled"] is bool(routed)
     assert result.metadata["ocr_pages"] == list(routed)
+    # One pass: the caller's result is LiteParse's own, as it returned it.
+    assert result.liteparse["document"]["pages"] == [page(1), page(2), page(3)]
+    assert result.liteparse["ocr_pages"] == list(routed)
 
 
 @pytest.mark.parametrize("bad", [Result([page(1)]), Result([page(2), page(2)]),
@@ -249,6 +293,49 @@ def test_real_liteparse_rotated_word_geometry(tmp_path):
     box = matches[0]["boxes_points"][0]
     # The original baseline near (72,720) becomes right/top after /Rotate90.
     assert 700 < box["x"] < 750 and 60 < box["y"] < 100
+
+
+def test_submit_returns_liteparses_result_only_when_asked_and_never_stores_it(sample_pdf, tmp_path, monkeypatch):
+    from pageindex import flash, utils
+    pages = [_page_record(page(n, f"text{n}"), parser_config("liteparse"), False) for n in (1, 2)]
+    document = {"pages": [page(1, "text1"), page(2, "text2")], "text": "text1\n\ntext2", "total_pages": 2,
+                "doc_meta": {"xmp": "<x:xmpmeta/>"}, "xfa_packets": [{"index": 0, "content": "<xdp/>"}]}
+    monkeypatch.setattr("pageindex.pdf_extraction.extract_liteparse", lambda *a: PDFExtraction(
+        pages, {"parser": "liteparse"}, liteparse={"version": "test", "document": document}))
+    monkeypatch.setattr(flash, "page_index_flash",
+                        lambda pdf, **k: {"structure": [{"title": "All", "start_index": 1, "end_index": 2}]})
+    monkeypatch.setattr(utils, "generate_doc_description", lambda *a, **k: "test")
+    store = tmp_path / "store"
+    client = PageIndexClient(index={"model": "m", "pdf_parser": "liteparse", "storage_path": str(store)})
+    asked = client.submit_document(sample_pdf, mode="flash", doc_id="asked", return_liteparse=True)
+    assert asked["liteparse"] == {"version": "test", "document": document} and asked["timings"]["total"] >= 0
+    plain = client.submit_document(sample_pdf, mode="flash", doc_id="plain", if_exists="replace")
+    assert "liteparse" not in plain
+    stored = "".join(f.read_text() for f in store.rglob("*.json"))
+    assert "xmpmeta" not in stored and "<xdp/>" not in stored
+    with pytest.raises(PageIndexAPIError, match="return_liteparse needs") as error:
+        PageIndexClient(model="m", storage_path=str(tmp_path / "other")).submit_document(
+            sample_pdf, return_liteparse=True)
+    assert error.value.status_code == 400
+    with pytest.raises(PageIndexAPIError, match="return_liteparse is local-only"):
+        PageIndexClient(api_key="x").submit_document(sample_pdf, return_liteparse=True)
+
+
+def test_real_liteparse_reads_the_document_level_fields_for_the_caller(tmp_path):
+    pytest.importorskip("liteparse")
+    pytest.importorskip("pdf_inspector")
+    from conftest import build_pdf
+    path = tmp_path / "plain.pdf"
+    path.write_bytes(build_pdf(["Hello page one", "Hello page two"]))
+    result = extract_liteparse(str(path), "liteparse")
+    document = result.liteparse["document"]
+    assert document["total_pages"] == 2 and [p["page_num"] for p in document["pages"]] == [1, 2]
+    assert document["doc_meta"] is not None and document["xfa_packets"] is not None
+    assert all(p["complexity"] is not None and p["annotations"] is not None for p in document["pages"])
+    assert result.liteparse["inspection"]["page_count"] == 2
+    # The blocks the caller gets are the ones the index stores.
+    assert [p["blocks"] for p in document["pages"]] == [p["layout"]["blocks"] for p in result.pages]
+    json.dumps(result.liteparse, allow_nan=False)
 
 
 def test_real_liteparse_ocr_of_image_only_pdf(tmp_path):

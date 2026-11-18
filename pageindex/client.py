@@ -918,6 +918,7 @@ class PageIndexClient:
         collection_id: Optional[str] = None,
         doc_id: Optional[str] = None,
         if_exists: Optional[str] = None,
+        return_liteparse: bool = False,
     ) -> dict[str, Any]:
         """
         Submit a PDF document for processing. Returns {'doc_id': ..., 'name': ...}.
@@ -973,6 +974,15 @@ class PageIndexClient:
                 ``"replace"`` reindexes and replaces the stored document
                 (tree, pages and metadata) under the same id; ``"error"``
                 (the default) refuses a taken id.
+            return_liteparse (bool): Local-only, with ``pdf_parser="liteparse"``
+                — also return LiteParse's own result of the read the index
+                was built from, as ``result["liteparse"]``. It is not stored
+                with the document and can be tens of MB for a long PDF:
+                ``document`` (the ParseResult as a dict: the full pass with
+                the OCR pages in place, its document-level fields), plus
+                ``version``, ``ocr_mode``, ``ocr_language``, ``ocr_backend``,
+                ``ocr_pages``, ``inspection`` (pdf-inspector's answer; None
+                unless ``ocr_mode="auto"``), ``passes`` and ``seconds``.
 
         Returns:
             dict: {'doc_id': ..., 'name': ...}. 'name' is the stored document
@@ -980,15 +990,18 @@ class PageIndexClient:
                 and a UserWarning is emitted. Older cloud servers omit 'name'.
                 Local also returns 'usage', the indexing model's tokens summed
                 over every call, in the Chat Completions usage shape
-                LiteLLM returns.
+                LiteLLM returns, 'timings' (seconds per stage) and, with
+                ``return_liteparse=True``, 'liteparse'.
         """
         extra = {name: value for name, value in
-                 (("doc_id", doc_id), ("if_exists", if_exists))
+                 (("doc_id", doc_id), ("if_exists", if_exists),
+                  ("return_liteparse", return_liteparse or None))
                  if value is not None}
         if extra and getattr(self, "api_key", None):
             raise PageIndexAPIError(
                 f"{' and '.join(extra)} {'is' if len(extra) == 1 else 'are'} "
-                "local-only — cloud documents get their id from PageIndex.")
+                "local-only — cloud documents get their id from PageIndex"
+                + (" and are read there." if return_liteparse else "."))
         result = self._api.submit_document(
             file_path=file_path, mode=mode,
             beta_headers=beta_headers, folder_id=folder_id, metadata=metadata,
