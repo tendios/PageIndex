@@ -231,6 +231,42 @@ def test_client_indexes_in_headings_mode_with_the_flash_summaries(tmp_path, samp
     assert "timings" not in features["pdf_extraction"]
 
 
+def test_headings_mode_checks_a_chosen_effort_before_the_judge(tmp_path, sample_pdf, monkeypatch):
+    """A chosen effort the summary model can't take fails the submit before the headings are read (Jev is paid per
+    page), as flash fails it before reading the PDF: in summary_reasoning_effort or in the index backend. Unset,
+    the summaries run at the least the model takes, stepping past a level its server refuses."""
+    pytest.importorskip("litellm")
+    import pageindex.flash.api
+    import pageindex.headings
+    import pageindex.pdf_extraction
+    import pageindex.utils
+
+    pages = pcap_pages()[:2]
+    monkeypatch.setattr(pageindex.pdf_extraction, "extract_liteparse",
+                        lambda path, conf: PDFExtraction(pages, {"parser": "liteparse", "layout": True, "ocr_pages": []}))
+    built, efforts = [], []
+    real = pageindex.headings.build_headings_structure
+    monkeypatch.setattr(pageindex.headings, "build_headings_structure",
+                        lambda *args, **kwargs: built.append(1) or real(*args, **kwargs))
+
+    async def fake_summarize(structure, page_list, model, **kwargs):
+        efforts.append((kwargs.get("reasoning_effort"), kwargs.get("drop_refused_effort")))
+    monkeypatch.setattr(pageindex.flash.api, "_summarize", fake_summarize)
+    monkeypatch.setattr(pageindex.utils, "generate_doc_description", lambda structure, model=None: "d")
+
+    def client(name, **index):
+        return PageIndexClient(index={"mode": "local", "model": "gpt-5-nano", "storage_path": str(tmp_path / name),
+                                      "pdf_parser": "liteparse", "heading_judge": "none", **index})
+    with pytest.raises(PageIndexAPIError, match="takes no summary_reasoning_effort='none'.*'minimal', the least"):
+        client("a", summary_reasoning_effort="none").submit_document(sample_pdf)
+    with pytest.raises(PageIndexAPIError, match=r"takes no index_backend\[\"reasoning_effort\"\]='none'"):
+        client("b", backend={"reasoning_effort": "none"}).submit_document(sample_pdf)
+    assert not built and not efforts
+    client("c", summary_reasoning_effort="low").submit_document(sample_pdf)
+    client("d").submit_document(sample_pdf)
+    assert efforts == [("low", False), ("minimal", True)]
+
+
 def test_headings_mode_needs_liteparse_and_a_known_judge(tmp_path, sample_pdf, monkeypatch):
     monkeypatch.delenv("TYPESAFE_AI_API_KEY", raising=False)
     client = PageIndexClient(storage_path=str(tmp_path / "store"))

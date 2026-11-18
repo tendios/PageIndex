@@ -232,8 +232,8 @@ class LocalAPI:
                 )
             elif mode == "headings":
                 structure, description = run_off_loop(
-                    self._with_backend, usage, self._index_headings, file_path,
-                    extraction, page_texts, doc_name
+                    self._with_backend, usage, (self._summary_model or self._model,),
+                    self._index_headings, file_path, extraction, page_texts, doc_name
                 )
             else:
                 structure, description = run_off_loop(
@@ -325,8 +325,8 @@ class LocalAPI:
                  "completion_tokens_details": {"reasoning_tokens": 0}}
 
         def complete(prompt: str) -> str:
-            return run_off_loop(self._with_backend, usage, llm_completion,
-                                self._model, prompt)
+            return run_off_loop(self._with_backend, usage, (self._model,),
+                                llm_completion, self._model, prompt)
 
         try:
             index = build_topic_index(
@@ -479,6 +479,16 @@ class LocalAPI:
             raise PageIndexAPIError(
                 "Failed to submit document: mode='headings' reads the headings LiteParse finds; configure "
                 "pdf_parser='liteparse'.")
+        summary_model = self._summary_model or self._model
+        effort = (self._summary_reasoning_effort or "").strip() or None
+        from .integrations.claude_agent_sdk import is_claude_code
+        if not is_claude_code(summary_model):
+            from .utils import chosen_effort, start_learning_if_effort_dropped
+            # As flash does: LiteLLM's published map downloads while the headings are read, and a chosen effort
+            # the model doesn't take fails here, before Jev and the summaries are paid for, unless that download
+            # may change the verdict (the summaries' own check judges then).
+            if not start_learning_if_effort_dropped(summary_model, effort) and effort:
+                chosen_effort(summary_model, effort, name="summary_reasoning_effort")
         timings = getattr(extraction, "timings", {})  # stubs in tests may lack it
         tick = perf_counter()
         # LiteParse's headings and Jev decide alone. Flash's layout pass used to add a vote: on the headings
@@ -492,7 +502,6 @@ class LocalAPI:
         backend = "headings"
         if not structure:
             structure, backend = _page_nodes(page_texts), "headings_pages"
-        summary_model = self._summary_model or self._model
         # A run of pages with no heading inside (a table of figures, a scan) can be longer than the summary
         # model reads: it is summarized page by page instead of failing the document.
         split = split_oversized_leaves(structure, page_texts, SUMMARY_MAX_INPUT_TOKENS, model=summary_model)
@@ -501,10 +510,8 @@ class LocalAPI:
         if split:
             extraction.metadata["headings"]["split_by_page"] = split
         write_node_id(structure)
-        from .integrations.claude_agent_sdk import is_claude_code
         if not is_claude_code(summary_model):
-            learn_model_if_effort_dropped(summary_model)
-        effort = (self._summary_reasoning_effort or "").strip() or None
+            learn_model_if_effort_dropped(summary_model, effort)  # before the default or the chosen check reads it
         defaulted = effort is None
         if defaulted:
             effort = default_summary_reasoning_effort(summary_model)
