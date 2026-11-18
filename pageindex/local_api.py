@@ -97,6 +97,7 @@ class LocalAPI:
         metadata: dict | None = None,
         doc_id: str | None = None,
         if_exists: str | None = None,
+        return_liteparse: bool = False,
     ) -> dict[str, Any]:
         if getattr(multiprocessing.current_process(), "_inheriting", False):
             raise PageIndexAPIError(
@@ -137,6 +138,10 @@ class LocalAPI:
             raise PageIndexAPIError(
                 "Failed to submit document: if_exists applies to a given "
                 "doc_id only.", status_code=400)
+        if return_liteparse and self._pdf_parser["name"] != "liteparse":
+            raise PageIndexAPIError(
+                "Failed to submit document: return_liteparse needs "
+                "pdf_parser=\"liteparse\".", status_code=400)
         replace = if_exists == "replace"
         if doc_id is not None and not replace:
             self._check_doc_id_free(doc_id)  # before indexing; rechecked at save
@@ -164,13 +169,16 @@ class LocalAPI:
                 "Failed to submit document: only PDF files are supported in local mode."
             )
 
-        extraction = None
+        extraction = liteparse = None
         started = perf_counter()
         try:
             if self._pdf_parser["name"] == "liteparse":
                 from .pdf_extraction import extract_liteparse
                 extraction = extract_liteparse(file_path, self._pdf_parser)
                 page_texts = extraction.texts
+                # LiteParse's own result goes back to a caller who asked for it, never into the store; dropped
+                # here otherwise, before the summaries.
+                liteparse, extraction.liteparse = extraction.liteparse if return_liteparse else None, None
             else:
                 page_texts = self._extract_page_texts(file_path)
         except PageIndexAPIError:
@@ -248,8 +256,11 @@ class LocalAPI:
                 doc_id, meta, remove_fields(structure, fields=["text"]), pages)
         timings["save"] = perf_counter() - tick
         timings["total"] = perf_counter() - started
-        return {"doc_id": doc_id, "name": meta["name"], "usage": usage,
-                "timings": {stage: round(seconds, 2) for stage, seconds in timings.items()}}
+        result = {"doc_id": doc_id, "name": meta["name"], "usage": usage,
+                  "timings": {stage: round(seconds, 2) for stage, seconds in timings.items()}}
+        if return_liteparse:
+            result["liteparse"] = liteparse
+        return result
 
     def _check_doc_id_free(self, doc_id: str) -> None:
         if self._store.get_meta(doc_id) is not None:
