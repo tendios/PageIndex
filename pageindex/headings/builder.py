@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..utils import strip_inline_marks
 from .candidates import ANNEX_WORDS, CHAPTER_WORDS, Candidate
 
 
@@ -25,7 +26,8 @@ def build_structure(headings: list[Candidate], total_pages: int) -> list[dict[st
     above (pages may be shared, as the index's own trees do)."""
     ordered = sorted(headings, key=lambda c: (c.page, c.order))
     has_chapters = any(c.keyword in CHAPTER_WORDS for c in ordered)
-    nodes = [{"title": c.text, "start_index": c.page, "end_index": c.page, "level": level_of(c, has_chapters), "nodes": []}
+    nodes = [{"title": strip_inline_marks(c.text) or c.text, "start_index": c.page, "end_index": c.page,
+              "level": level_of(c, has_chapters), "nodes": []}
              for c in ordered]
     for i, node in enumerate(nodes):
         following = next((m for m in nodes[i + 1:] if m["level"] <= node["level"]), None)
