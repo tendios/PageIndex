@@ -36,6 +36,91 @@ def _now_iso() -> str:
     return now.replace(microsecond=now.microsecond // 1000 * 1000).isoformat()
 
 
+def _zero_usage() -> dict[str, Any]:
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 0,
+                                      "cache_write_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 0}}
+
+
+def _check_submit_arguments(prefix: str, metadata, doc_id, if_exists) -> None:
+    """What submit_document and submit_pages take alike: metadata, doc_id and if_exists."""
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise PageIndexAPIError(f"{prefix}: metadata must be a dict.")
+        try:
+            json.dumps(metadata, allow_nan=False)
+        except (TypeError, ValueError) as e:
+            raise PageIndexAPIError(
+                f"{prefix}: metadata must be valid JSON. {e}"
+            ) from e
+    if doc_id is not None and not (
+            isinstance(doc_id, str) and _DOC_ID.fullmatch(doc_id)
+            and doc_id not in (".", "..")):
+        raise PageIndexAPIError(
+            f"{prefix}: invalid doc_id {doc_id!r} — 1 to "
+            "128 letters, digits, '-', '_' or '.'.", status_code=400)
+    if if_exists not in (None, "error", "replace"):
+        raise PageIndexAPIError(
+            f"{prefix}: if_exists must be \"error\" or "
+            f"\"replace\", got {if_exists!r}.", status_code=400)
+    if if_exists is not None and doc_id is None:
+        raise PageIndexAPIError(
+            f"{prefix}: if_exists applies to a given "
+            "doc_id only.", status_code=400)
+
+
+# The keys a node of submit_pages' structure may carry; node_id is written by PageIndex.
+_GIVEN_NODE_KEYS = frozenset({"title", "start_index", "end_index", "summary", "nodes"})
+
+
+def _given_structure(structure, page_count: int) -> list[dict]:
+    """submit_pages' structure, checked and copied: nodes with a title and the pages they span (1-based,
+    inclusive, within the document), optionally a summary and child nodes. None: one node per page."""
+    prefix = "Failed to submit pages"
+    if structure is None:
+        return [{"title": f"Page {index}", "start_index": index, "end_index": index}
+                for index in range(1, page_count + 1)]
+    if not isinstance(structure, list) or not structure:
+        raise PageIndexAPIError(
+            f"{prefix}: structure must be a non-empty list of nodes.", status_code=400)
+
+    def node(raw, where: str) -> dict:
+        if not isinstance(raw, dict):
+            raise PageIndexAPIError(f"{prefix}: {where} is not a node (a dict).", status_code=400)
+        unknown = sorted(set(raw) - _GIVEN_NODE_KEYS)
+        if unknown:
+            raise PageIndexAPIError(
+                f"{prefix}: {where} has unknown keys {unknown}; a node takes "
+                f"{sorted(_GIVEN_NODE_KEYS)}.", status_code=400)
+        title = raw.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise PageIndexAPIError(f"{prefix}: {where} needs a title.", status_code=400)
+        start, end = raw.get("start_index"), raw.get("end_index")
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (start, end)) \
+                or not 1 <= start <= end <= page_count:
+            raise PageIndexAPIError(
+                f"{prefix}: {where} ({title!r}) spans pages {start!r}-{end!r}; they must be integers "
+                f"with 1 <= start_index <= end_index <= {page_count}.", status_code=400)
+        out = {"title": _scrub_surrogates(title.strip()), "start_index": start, "end_index": end}
+        summary = raw.get("summary")
+        if summary is not None:
+            if not isinstance(summary, str):
+                raise PageIndexAPIError(f"{prefix}: {where} has a summary that is not a string.",
+                                        status_code=400)
+            out["summary"] = _scrub_surrogates(summary)
+        children = raw.get("nodes")
+        if children is not None:
+            if not isinstance(children, list):
+                raise PageIndexAPIError(f"{prefix}: {where} has nodes that are not a list.",
+                                        status_code=400)
+            if children:
+                out["nodes"] = [node(child, f"{where}.nodes[{i}]") for i, child in enumerate(children)]
+        return out
+
+    return [node(raw, f"structure[{i}]") for i, raw in enumerate(structure)]
+
+
 
 
 class LocalAPI:
@@ -131,31 +216,7 @@ class LocalAPI:
             raise PageIndexAPIError(
                 "Failed to submit document: collections are not supported in local mode."
             )
-        if metadata is not None:
-            if not isinstance(metadata, dict):
-                raise PageIndexAPIError(
-                    "Failed to submit document: metadata must be a dict."
-                )
-            try:
-                json.dumps(metadata, allow_nan=False)
-            except (TypeError, ValueError) as e:
-                raise PageIndexAPIError(
-                    f"Failed to submit document: metadata must be valid JSON. {e}"
-                ) from e
-        if doc_id is not None and not (
-                isinstance(doc_id, str) and _DOC_ID.fullmatch(doc_id)
-                and doc_id not in (".", "..")):
-            raise PageIndexAPIError(
-                f"Failed to submit document: invalid doc_id {doc_id!r} — 1 to "
-                "128 letters, digits, '-', '_' or '.'.", status_code=400)
-        if if_exists not in (None, "error", "replace"):
-            raise PageIndexAPIError(
-                "Failed to submit document: if_exists must be \"error\" or "
-                f"\"replace\", got {if_exists!r}.", status_code=400)
-        if if_exists is not None and doc_id is None:
-            raise PageIndexAPIError(
-                "Failed to submit document: if_exists applies to a given "
-                "doc_id only.", status_code=400)
+        _check_submit_arguments("Failed to submit document", metadata, doc_id, if_exists)
         if return_liteparse and self._pdf_parser["name"] != "liteparse":
             raise PageIndexAPIError(
                 "Failed to submit document: return_liteparse needs "
@@ -215,10 +276,7 @@ class LocalAPI:
         if extraction is not None:
             extraction.timings = timings
 
-        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-                 "prompt_tokens_details": {"cached_tokens": 0,
-                                           "cache_write_tokens": 0},
-                 "completion_tokens_details": {"reasoning_tokens": 0}}
+        usage = _zero_usage()
         try:
             if mode == "flash":
                 structure, description = run_off_loop(
@@ -284,6 +342,67 @@ class LocalAPI:
         if return_liteparse:
             result["liteparse"] = liteparse
         return result
+
+    def submit_pages(
+        self,
+        name: str,
+        pages: list[str],
+        structure: list[dict] | None = None,
+        *,
+        description: str | None = None,
+        metadata: dict | None = None,
+        doc_id: str | None = None,
+        if_exists: str | None = None,
+    ) -> dict[str, Any]:
+        """A document from pages the caller already has, stored as an indexed one; no model is called and no file
+        is read (see PageIndexClient.submit_pages)."""
+        prefix = "Failed to submit pages"
+        if getattr(multiprocessing.current_process(), "_inheriting", False):
+            raise PageIndexAPIError(
+                f"{prefix}: called again while a spawned worker process was importing your script. Put your "
+                "top-level code under if __name__ == '__main__': so worker processes do not re-run it.")
+        _check_submit_arguments(prefix, metadata, doc_id, if_exists)
+        if not isinstance(name, str) or not name.strip():
+            raise PageIndexAPIError(f"{prefix}: name must be a non-empty string.", status_code=400)
+        if not isinstance(pages, list) or not pages or not all(isinstance(page, str) for page in pages):
+            raise PageIndexAPIError(
+                f"{prefix}: pages must be a non-empty list of strings, each page's markdown, page 1 first.",
+                status_code=400)
+        if description is not None and not isinstance(description, str):
+            raise PageIndexAPIError(f"{prefix}: description must be a string.", status_code=400)
+        texts = [_scrub_surrogates(page) for page in pages]
+        if not any(text.strip() for text in texts):
+            raise PageIndexAPIError(f"{prefix}: the pages have no content. All pages are blank.")
+        tree = _given_structure(structure, len(texts))
+        replace = if_exists == "replace"
+        if doc_id is not None and not replace:
+            self._check_doc_id_free(doc_id)  # rechecked at save
+        doc_name = sanitize_filename(name)
+        self._unique_doc_name(doc_name, doc_id if replace else None)
+        started = perf_counter()
+        from .utils import write_node_id
+        write_node_id(tree)
+        if doc_id is None:
+            doc_id = "pi-" + uuid.uuid4().hex
+        stored = [{"page_index": i + 1, "markdown": text} for i, text in enumerate(texts)]
+        with self._store.lock():
+            if not replace:
+                self._check_doc_id_free(doc_id)
+            meta = {
+                "id": doc_id,
+                "name": self._unique_doc_name(doc_name, doc_id if replace else None),
+                "description": _scrub_surrogates(description) if description is not None else None,
+                "status": "completed",
+                "createdAt": _now_iso(),
+                "pageNum": len(texts),
+                "folderId": None,
+                "metadata": metadata,
+                "mode": "pages",
+            }
+            self._store.save_document(doc_id, meta, tree, stored)
+        seconds = round(perf_counter() - started, 2)
+        return {"doc_id": doc_id, "name": meta["name"], "usage": _zero_usage(),
+                "timings": {"save": seconds, "total": seconds}}
 
     def _check_doc_id_free(self, doc_id: str) -> None:
         if self._store.get_meta(doc_id) is not None:

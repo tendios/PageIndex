@@ -1023,6 +1023,69 @@ class PageIndexClient:
             self._wait_until_ready(result["doc_id"])
         return result
 
+    def submit_pages(
+        self,
+        name: str,
+        pages: list[str],
+        structure: Optional[list[dict]] = None,
+        *,
+        description: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        doc_id: Optional[str] = None,
+        if_exists: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Local-only: store a document from pages you already have, with no
+        file to read and no model call: its markdown page by page and,
+        optionally, its tree. Nothing is summarized or extracted; what you
+        give is what is stored, as an indexed document is. The chat, the
+        agent tools, ``extract()`` and ``get_citations()`` read it as any
+        other: page-level citations, since its pages carry no layout
+        blocks. For content that is not a PDF and is already structured
+        (a spreadsheet's tables, a page per chunk of rows), or text read
+        elsewhere.
+
+        Args:
+            name (str): The document's name, as citations name it; a taken
+                name gains a numeric suffix, as in ``submit_document()``.
+            pages (list[str]): The markdown of each page, page 1 first. At
+                least one must have content.
+            structure (list[dict], optional): The tree: nodes with
+                ``title`` and the pages they span, ``start_index`` and
+                ``end_index`` (1-based, inclusive, within ``pages``), and
+                optionally ``summary`` and child ``nodes``; any other key
+                is refused. ``node_id`` is written by PageIndex. Without
+                it, one node per page (``Page 1``, ``Page 2``...).
+            description (str, optional): The document's description, as
+                ``get_document()`` and the agent's tools show it.
+            metadata (dict, optional): Your own JSON tags, as in
+                ``submit_document()``.
+            doc_id (str, optional): Store it under your own id, as in
+                ``submit_document()``; a taken id raises
+                PageIndexAPIError (status_code 409).
+            if_exists (str, optional): With ``doc_id``, ``"replace"``
+                replaces the stored document (tree, pages and metadata);
+                ``"error"`` (the default) refuses a taken id.
+
+        Returns:
+            dict: ``{'doc_id', 'name', 'usage', 'timings'}``: ``usage`` is
+            all zeros (no model is called), ``timings`` the seconds it
+            took to save. The stored document's ``mode`` is ``"pages"``.
+            Invalid arguments raise PageIndexAPIError (status_code 400);
+            pages all blank raise it without status, as a blank PDF does.
+        """
+        if getattr(self, "api_key", None):
+            raise PageIndexAPIError(
+                "submit_pages is local-only — cloud documents are indexed "
+                "from their files by PageIndex.")
+        result = self._api.submit_pages(
+            name, pages, structure, description=description, metadata=metadata,
+            doc_id=doc_id, if_exists=if_exists)
+        stored = result.get("name")
+        if stored and stored != name:
+            warnings.warn(f'Document "{name}" was stored as "{stored}".', stacklevel=2)
+        return result
+
     def _wait_until_ready(self, doc_id: str, timeout: float = 1800.0) -> None:
         import requests
         interval = 2.0

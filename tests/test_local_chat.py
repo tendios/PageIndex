@@ -2286,6 +2286,45 @@ def test_chat_cites_a_caller_chosen_doc_id(client, store_path, fake_model):
 
 
 @needs_agents
+def test_chat_reads_and_cites_a_document_of_given_pages(client, fake_model):
+    """submit_pages: the agent reads the given pages with the same tools,
+    and its page-level citations resolve to the document and the page."""
+    pages = ["## Presupuesto\n\n| Partida | Importe |\n| --- | --- |\n| Excavación | 1200 |",
+             "## Resumen\n\n| Total |\n| --- |\n| 2000 |"]
+    client.submit_pages("presupuesto.xlsx", pages,
+                        [{"title": "Presupuesto", "start_index": 1, "end_index": 1},
+                         {"title": "Resumen", "start_index": 2, "end_index": 2}],
+                        doc_id="sheet-1")
+    fake = fake_model([
+        [_call_item("get_document_structure", {"doc_name": "presupuesto.xlsx"})],
+        [_call_item("get_page_content", {"doc_name": "presupuesto.xlsx", "pages": "2"},
+                    call_id="call_2")],
+        [_msg_item('El total es 2000 <cite doc="presupuesto.xlsx" page="2"/>.')],
+    ])
+    answer = client.chat("¿Total?", doc_id="sheet-1", citations=True)
+    # the structure tool gives the sheets' titles, the page tool the page as given
+    assert "Resumen" not in json.dumps(fake.inputs[0]) and "Resumen" in json.dumps(fake.inputs[1])
+    assert "| 2000 |" not in json.dumps(fake.inputs[1]) and "| 2000 |" in json.dumps(fake.inputs[2])
+    assert client.get_citations(answer, doc_id="sheet-1") == [
+        {"document": "presupuesto.xlsx", "doc_id": "sheet-1", "page": 2}]
+
+
+@needs_agents
+def test_extract_from_a_document_of_given_pages(client, fake_model):
+    client.submit_pages("presupuesto.xlsx", ["## Resumen\n\n| Total |\n| --- |\n| 2000 |"],
+                        [{"title": "Resumen", "start_index": 1, "end_index": 1}], doc_id="sheet-1")
+    fake_model([
+        [_call_item("get_page_content", {"doc_name": "presupuesto.xlsx", "pages": "1"})],
+        [_call_item("submit_result", {"data": {"price": 2000, "currency": "EUR"},
+                                      "sources": [{"field": "price", "doc_id": "sheet-1", "page": 1}]},
+                    call_id="call_2")],
+    ])
+    result = client.extract("¿Total?", PRICE_SCHEMA, doc_id="sheet-1")
+    assert result["data"] == {"price": 2000, "currency": "EUR"}
+    assert result["sources"] == [{"field": "price", "doc_id": "sheet-1", "page": 1}]
+
+
+@needs_agents
 def test_chat_on_a_doc_list_leads_with_the_library_view(client, store_path,
                                                         fake_model):
     """A doc_id list puts every outline in the first message, so the
