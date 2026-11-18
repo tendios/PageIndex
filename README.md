@@ -29,10 +29,10 @@
 
 ## Fork tendios/PageIndex
 
-Este fork parte de [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) `v0.5.1` y se publica con etiquetas `v<upstream>-tendios.<n>` (versión del paquete `<upstream>+tendios.<n>`); fija una etiqueta, nunca `main`:
+Este fork parte de [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) `v0.6.0` y se publica con etiquetas `v<upstream>-tendios.<n>` (versión del paquete `<upstream>+tendios.<n>`); fija una etiqueta, nunca `main`:
 
 ```bash
-pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.5.1-tendios.3"
+pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.6.0-tendios.1"
 ```
 
 ### Diferencias con upstream
@@ -52,7 +52,7 @@ Las extensiones de indexado se activan en modo local; el modo cloud conserva su 
 Instalación de la versión del fork con LiteParse:
 
 ```bash
-pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.5.1-tendios.3"
+pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.6.0-tendios.1"
 ```
 
 Para desarrollar desde este checkout:
@@ -107,7 +107,9 @@ LiteParse). El árbol se construye con los encabezados que LiteParse marca (`#`,
 documento («1.2», «Cláusula 3», «Annex 2»), las entradas de sus páginas de índice localizadas en el cuerpo y los
 títulos que detecta la maquetación de flash; descarta encabezados y pies repetidos, celdas de tabla e ítems de lista,
 y un juez decide las líneas que ninguna regla resuelve. Después siguen los resúmenes y la descripción de flash, sin
-optimizador: un apartado corto sigue siendo un apartado, porque así se pide el documento.
+optimizador: un apartado corto sigue siendo un apartado, porque así se pide el documento. Los resúmenes piensan lo
+mínimo que admite cada modelo, como en flash desde upstream 0.5.3; un `summary_reasoning_effort` elegido que el modelo
+no admite hace fallar el envío antes de leer los encabezados, sin gastar en Jev.
 
 ```python
 client = PageIndexClient(index={"mode": "local", "model": "anthropic/claude-haiku-5-5",
@@ -174,7 +176,7 @@ en la configuración del índice fuerza un idioma concreto.
 git remote add upstream https://github.com/VectifyAI/PageIndex.git
 git fetch upstream --tags
 git switch -c rebase/<versión> main
-git rebase upstream/main          # o la etiqueta, p. ej. v0.5.1
+git rebase upstream/main          # o la etiqueta, p. ej. v0.6.0
 python -m pytest -q               # tras resolver conflictos
 ```
 
