@@ -1202,6 +1202,20 @@ def fallback_summary(node, text=""):
     return summary[:FALLBACK_SUMMARY_CHARS] or node.get('title') or ""
 
 
+# The inline formatting LiteParse 2.19 writes into block text besides **bold** and *italic*: <u>, <sup>,
+# <sub> and ~~strike~~; with them the other HTML formatting tags and the line break a markdown writer uses.
+_INLINE_TAGS = re.compile(r"</?(?:u|sup|sub|s|strike|del|ins|mark|small|b|i|em|strong)>|<br\s*/?>")
+_STRIKE_MARKS = re.compile(r"~~(?=\S)|(?<=\S)~~")
+
+
+def strip_inline_marks(text):
+    """The text without its inline formatting: «<u>CLÁUSULA 5. OBJETO</u>» reads
+    «CLÁUSULA 5. OBJETO», «m<sup>3</sup>» reads «m3». A tag goes and its text
+    stays, a line break is a space, and runs of whitespace become one."""
+    text = _INLINE_TAGS.sub(lambda m: " " if m.group().startswith("<br") else "", text or "")
+    return " ".join(_STRIKE_MARKS.sub("", text).split())
+
+
 INTRO_SUFFIX = " (intro)"
 
 

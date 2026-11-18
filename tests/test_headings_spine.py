@@ -149,3 +149,41 @@ def test_unnumbered_titles_are_siblings_under_their_section_not_a_chain():
                   head(4, "Revisión")], 1)
     assert [(n["title"], [c["title"] for c in n.get("nodes", [])]) for n in tree] == [
         ("1. Objeto", ["Lotes", "Plazos"]), ("2. Precio", ["Revisión"])]
+
+
+@pytest.mark.parametrize("text, title", [
+    ("<u>CLÁUSULA 5. OBJETO</u>", "CLÁUSULA 5. OBJETO"),
+    ("Precio por m<sup>3</sup>", "Precio por m3"),
+    ("Emisiones de CO<sub>2</sub>", "Emisiones de CO2"),
+    ("~~TEL: 900 000 000~~ Contacto", "TEL: 900 000 000 Contacto"),
+    ("Lotes<br>y  plazos", "Lotes y plazos"),
+    ("25. Productes metàl·lics <u>Lot 4", "25. Productes metàl·lics Lot 4"),  # the closing tag on the next line
+    ("Si a < b > c", "Si a < b > c"),
+])
+def test_inline_marks_go_and_their_text_stays(text, title):
+    from pageindex.utils import strip_inline_marks
+    assert strip_inline_marks(text) == title
+
+
+def test_titles_drop_liteparse_inline_tags_and_the_page_text_keeps_them():
+    """LiteParse 2.19 underlines and raises inside block text («<u>**CLÁUSULA 1…**</u>», «m<sup>3</sup>»): the tree's
+    titles read without the tags, the nested bold too; the page markdown and the blocks stay as LiteParse wrote them,
+    and a title still finds its line there: the heading opens its page, so the Preface ends before it, and the leaf
+    that shares the next heading's page stops at that heading's line."""
+    import copy
+
+    from pageindex.utils import leaf_own_text
+    pages = [page(1, [("paragraph", "Texto de portada del pliego de cláusulas.")]),
+             page(2, [("heading", "## <u>**CLÁUSULA 1. OBJETO DEL CONTRATO**</u>"),
+                      ("paragraph", "El suministro de 20 m<sup>3</sup> de arena.")]),
+             page(3, [("paragraph", "Texto que sigue de la cláusula primera."),
+                      ("heading", "## <u>**CLÁUSULA 2. PRECIO POR m<sup>3</sup>**</u>"), ("paragraph", "El precio.")])]
+    raw = copy.deepcopy(pages)
+    texts = [p["markdown"] for p in pages]
+    structure, _ = build_headings_structure(pages, texts)
+    assert [(n["title"], n["start_index"], n["end_index"]) for n in structure] == [
+        ("Preface", 1, 1), ("CLÁUSULA 1. OBJETO DEL CONTRATO", 2, 3), ("CLÁUSULA 2. PRECIO POR m3", 3, 3)]
+    assert pages == raw
+    own = leaf_own_text(structure, structure[1], [(t, 0) for t in texts])
+    assert "## <u>**CLÁUSULA 1. OBJETO DEL CONTRATO**</u>" in own and "20 m<sup>3</sup>" in own
+    assert "Texto que sigue de la cláusula primera." in own and "CLÁUSULA 2" not in own

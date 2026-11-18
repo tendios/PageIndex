@@ -11,6 +11,7 @@ import re
 from collections import Counter
 from typing import Any, Optional
 
+from ..utils import strip_inline_marks
 from .candidates import (LETTER_ITEM, MAX_TEXT, Candidate, _carries_page_number, _closest, _flatten,
                          _located_index_entries, _order_in_page, _snippet, is_repeated, masked, norm, repeated_texts,
                          similar, strip_num, tableish)
@@ -567,8 +568,11 @@ def build(headings: list[Candidate], total_pages: int) -> list[dict[str, Any]]:
 
 def _title(c: Candidate) -> str:
     """The heading as it reads, cut where a numbered paragraph's body starts: «9.2 La capacitat d'obrar de les
-    empreses…» keeps its first clause, not the paragraph."""
-    text = c.text
+    empreses…» keeps its first clause, not the paragraph. LiteParse's inline formatting goes and its text stays
+    («<u>CLÁUSULA 5. OBJETO</u>» reads «CLÁUSULA 5. OBJETO», «m<sup>3</sup>» «m3»): only the title, the candidate
+    keeps the text the rules read, and the page markdown and blocks stay as LiteParse wrote them. What matches a
+    title against its page (tree_optimize.normalize) drops the tags on both sides."""
+    text = strip_inline_marks(c.text) or c.text
     if len(text) <= 120:
         return text
     cut = re.search(r"[.:;](?=\s)", text[20:120])

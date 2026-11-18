@@ -65,7 +65,7 @@ from types import SimpleNamespace
 
 from .utils import (SUMMARY_MAX_WORDS, TOKENS_PER_WORD, ConfigLoader, _is_unrecoverable,
                     count_tokens, intro_title, is_intro, llm_acompletion,
-                    llm_priority, strip_internal_keys)
+                    llm_priority, strip_inline_marks, strip_internal_keys)
 
 TRIGGER_PAGES = 5        # only look ahead on nodes larger than this
 ROUTING_COST = 1         # R(v), in pages
@@ -113,8 +113,11 @@ HAN_SPACE = f" (?=[{HAN_KANA}])|(?<=[{HAN_KANA}]) "
 def normalize(text):
     """Letters, digits and marks of any script, casefolded; other runs become one
     space, and none stays between two Han or kana characters: those scripts put no
-    space between words, so one there is layout (letter spacing, a wrapped line)."""
-    text = unicodedata.normalize("NFKC", text or "").casefold()
+    space between words, so one there is layout (letter spacing, a wrapped line).
+    Inline formatting tags go first, their text staying (strip_inline_marks): a
+    title read without them («m3») still matches the page line that has them
+    («m<sup>3</sup>»), and the tags' names never pass for words."""
+    text = unicodedata.normalize("NFKC", strip_inline_marks(text)).casefold()
     text = " ".join("".join(c if unicodedata.category(c)[0] in "LMN" else " "
                             for c in text).split())
     return re.sub(f"(?<=[{HAN_KANA}]) (?=[{HAN_KANA}])", "", text)
