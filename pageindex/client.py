@@ -492,7 +492,11 @@ class PageIndexClient:
             the effort as is, and a level the server refuses (HTTP 400 or
             422) gives way to the next, then to none sent, once a prompt goes
             through a step down; the process then skips it (never on
-            ``claude-code/``, whose effort is checked up front).
+            ``claude-code/``, whose effort is checked up front). An
+            ``openai/`` model LiteLLM doesn't know (one an OpenAI-compatible
+            server such as vLLM serves) gets ``"none"`` alone: a call it
+            refuses goes again without the effort, and the next call sends
+            ``"none"`` again.
             ``"none"`` also raises on a model whose thinking can't be
             turned off (Claude Opus 5.5 and Fable under those routes) and
             on any ``claude-code/`` model; the default runs them at

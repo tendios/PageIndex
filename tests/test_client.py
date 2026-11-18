@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import importlib
 import inspect
+import itertools
 import json
 import os
 import re
@@ -4448,8 +4449,9 @@ def test_flash_summaries_send_the_reasoning_effort_and_expand_does_not(tmp_path,
 def test_summary_effort_ladder_follows_litellms_map(monkeypatch):
     """Least thinking first: a level LiteLLM's map flags unsupported is
     skipped (a server LiteLLM passes it to as is would refuse it),
-    "minimal" is tried only where the map flags it; a model the map lacks
-    tries "none", then "low"."""
+    "minimal" is tried only where the map flags it; a model the map holds
+    with no flags tries "none", then "low"; an openai/ model the map lacks
+    (an OpenAI-compatible server's: vLLM, ...) takes "none" alone."""
     pytest.importorskip("litellm")
     import litellm
     from pageindex.utils import summary_effort_ladder
@@ -4465,14 +4467,16 @@ def test_summary_effort_ladder_follows_litellms_map(monkeypatch):
              "ladder-silent": flags()}
 
     def info(model):
-        return infos[model.rsplit("/", 1)[-1]]
+        name = model.rsplit("/", 1)[-1]
+        return {**infos[name], "key": name}
     monkeypatch.setattr(litellm, "get_model_info", info)
+    monkeypatch.setattr(litellm, "model_cost", {**litellm.model_cost, **{name: {} for name in infos}})
     for model, ladder in (("openai/ladder-gpt-5", ["minimal", "low"]),
                           ("openai/ladder-sol", ["low"]),
                           ("openai/ladder-pro", []),
                           ("openai/ladder-luna", ["none", "low"]),
                           ("openai/ladder-silent", ["none", "low"]),
-                          ("openai/ladder-unmapped", ["none", "low"])):
+                          ("openai/ladder-unmapped", ["none"])):
         assert summary_effort_ladder(model) == [{"reasoning_effort": level} for level in ladder], model
 
 
@@ -4571,7 +4575,7 @@ def test_effort_checks_read_the_backend_as_the_call_carries_it():
 
 
 def test_flash_summaries_drop_a_default_effort_the_server_refuses(tmp_path, monkeypatch):
-    """A default effort refused (400 or 422) steps up the ladder, then to
+    """On a model LiteLLM's map knows, a default effort refused (400 or 422) steps up the ladder, then to
     none sent, once a prompt goes through a step up, calls refused after
     the step included; a prompt refused at every step keeps it; another
     refusal (a prompt too long for the model, or one a content filter
@@ -4595,7 +4599,7 @@ def test_flash_summaries_drop_a_default_effort_the_server_refuses(tmp_path, monk
             self.status_code = status_code
     sent = []
 
-    def run(optimize, refuse, effort=None, concurrency=1, status=400, model="gpt-9-preview",
+    def run(optimize, refuse, effort=None, concurrency=1, status=400, model="gpt-6-luna",
             remember=False, error=None):
         sent.clear()
         if not remember:  # a document of its own process
@@ -4655,6 +4659,89 @@ def test_flash_summaries_drop_a_default_effort_the_server_refuses(tmp_path, monk
         assert set(sent) == {"high"}
         run(optimize, lambda params: len(sent) == 1, model="claude-code/haiku")
         assert len(sent) > 2 and set(sent) == {"none"}
+
+
+@contextlib.contextmanager
+def _openai_compatible_server(refuse):
+    """A loopback OpenAI-compatible chat server (as vLLM serves one): records the reasoning_effort each request
+    carries (None when absent) and answers a summary, or a plain 400 to the requests `refuse` picks (by the
+    request and how many the server has had)."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    sent, count = [], itertools.count(1)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
+            sent.append(request.get("reasoning_effort"))
+            if refuse(request, next(count)):
+                status, body = 400, {"error": {"message": "Bad request", "type": "BadRequestError", "code": 400}}
+            else:
+                status, body = 200, {"id": "x", "object": "chat.completion", "created": 0, "model": request["model"],
+                                     "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                                         "role": "assistant", "content": '{"summary": "ok"}'}}],
+                                     "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}}
+            raw = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/v1", sent
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_an_openai_compatible_server_gets_none_or_nothing_call_by_call():
+    """An openai/ model LiteLLM's map doesn't know, served by an OpenAI-compatible server (Gemma under vLLM, where
+    "low" turns its thinking on): the summaries send "none" and nothing above it. A plain 400 to a call carrying it
+    sends that call again without the effort, never at "minimal" or "low", and the process remembers nothing: the
+    next call, and the next document, start from "none" again. A model the map knows keeps upstream's ladder."""
+    pytest.importorskip("litellm")
+    import pageindex.utils as utils
+
+    model = "openai/nvidia/Gemma-4-26B-A4B-NVFP4"
+    assert utils.summary_effort_ladder(model) == [{"reasoning_effort": "none"}]
+    assert utils.default_summary_reasoning_effort(model) == "none"
+    assert utils.summary_effort_ladder("openai/gpt-6-luna") == [{"reasoning_effort": "none"},
+                                                                {"reasoning_effort": "low"}]
+    assert utils.summary_effort_ladder("gpt-5-nano") == [{"reasoning_effort": "minimal"},
+                                                         {"reasoning_effort": "low"}]
+
+    def document(pages=3):
+        return [{"title": f"Section {k}", "start_index": k, "end_index": k} for k in range(1, pages + 1)], \
+            [(f"Text of section {k}. " * 40, 0) for k in range(1, pages + 1)]
+
+    def summarize(url):
+        tree, pages = document()
+        token = utils._llm_backend.set({"api_base": url, "api_key": "test"})
+        try:
+            asyncio.run(utils.summarize_tree(tree, pages, model=model, small_node_tokens=0, concurrency=1,
+                                             reasoning_effort="none", drop_refused_effort=True))
+        finally:
+            utils._llm_backend.reset(token)
+        return tree
+
+    with _openai_compatible_server(lambda request, n: n == 1 and "reasoning_effort" in request) as (url, sent):
+        tree = summarize(url)
+        assert sent == ["none", None, "none", "none"]  # the refused call once more without it, then "none" again
+        assert all(node["summary"] == "ok" for node in tree)
+        assert utils._refused(model, url) == set()
+        sent.clear()
+        summarize(url)  # the next document
+        assert sent == ["none", "none", "none"]
+
+    with _openai_compatible_server(lambda request, n: "reasoning_effort" in request) as (url, sent):
+        summarize(url)  # a server that refuses every effort: each call goes again without it
+        assert sent == ["none", None, "none", None, "none", None]
 
 
 def test_flash_refuses_a_chosen_effort_the_model_cannot_honor(tmp_path, monkeypatch):

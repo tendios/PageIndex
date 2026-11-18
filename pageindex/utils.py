@@ -1390,6 +1390,18 @@ def _rung_key(params):
     return json.dumps(params, sort_keys=True)
 
 
+def _openai_compatible_unknown(model):
+    """Whether `model` is an openai/ id LiteLLM's map doesn't know: a model
+    an OpenAI-compatible server behind a base URL serves (vLLM, ...), not
+    one of OpenAI's own, whose ids the map (the published one learned)
+    holds."""
+    try:
+        model = _litellm_model(model)
+    except Exception:
+        return False
+    return bool(model) and model.split("/", 1)[0] == "openai" and not _in_model_map(model)
+
+
 def summary_effort_ladder(model):
     """The summary efforts to try on `model`, least thinking first, as
     llm_acompletion params. A Claude model LiteLLM routes as Claude takes
@@ -1402,11 +1414,20 @@ def summary_effort_ladder(model):
     Never one LiteLLM sends as thinking turned on (an effort on a model that
     thinks only when asked: a Claude model behind a Bedrock ARN, Amazon
     Nova 2 by its reasoningConfig). Less the rungs this process saw the
-    server refuse."""
+    server refuse. An openai/ model LiteLLM doesn't know
+    (_openai_compatible_unknown) takes "none" alone: its server's 400 may
+    have another cause the call doesn't name, and a level above can turn on
+    the thinking "none" keeps off (Gemma under vLLM thinks at "low");
+    SummaryScheduler drops it from the one call it refuses."""
     try:
         model = _litellm_model(model)
     except Exception:  # the call itself will say why
         return [{"reasoning_effort": SUMMARY_REASONING_EFFORT}]
+    if _openai_compatible_unknown(model):
+        rung: dict = {"reasoning_effort": SUMMARY_REASONING_EFFORT}
+        if not _sends(model, rung):
+            rung["allowed_openai_params"] = ["reasoning_effort"]
+        return [rung] if _sends(model, rung) else []
     if _claude_routed(model):
         rungs = _claude_ladder(model)
     else:
@@ -1687,6 +1708,8 @@ class SummaryScheduler:
         self._split_shared_pages = split_shared_pages
         from .integrations.claude_agent_sdk import is_claude_code
         self._ladder = None
+        # an OpenAI-compatible server's refusal holds for its call alone: the next starts from "none" again
+        self._remember_refusals = not _openai_compatible_unknown(model)
         if not reasoning_effort:
             self._params = {}
         elif is_claude_code(model):
@@ -1759,7 +1782,8 @@ class SummaryScheduler:
             return await llm_acompletion(self._model, prompt, **params)
         # a refused rung gives way to the next, then to none sent; the ones
         # passed over are to blame only if the prompt goes through, and the
-        # process then remembers them
+        # process then remembers them (not an OpenAI-compatible server's:
+        # its "none" goes again with the next call)
         refused = []
         for rung in self._ladder[self._ladder.index(params):] + [{}]:
             try:
@@ -1769,7 +1793,7 @@ class SummaryScheduler:
                     refused.append(rung)
                     continue
                 raise
-            if refused:
+            if refused and self._remember_refusals:
                 _refused(_litellm_model(self._model), _base(_llm_backend.get() or {})).update(
                     map(_rung_key, refused))
                 self._params = rung
@@ -1937,7 +1961,8 @@ async def summarize_tree(structure, pdf_pages, model=None, small_node_tokens=Non
     backend's, as chosen_effort carries it, and with `drop_refused_effort`
     it marks PageIndex's default instead: the calls walk
     summary_effort_ladder, a rung the server refuses giving way to the next
-    (never on claude-code/, whose effort is checked up front); with
+    (never on claude-code/, whose effort is checked up front; on an openai/
+    model LiteLLM doesn't know, only for the call it refused); with
     `max_input_tokens` no call reads more text than that (a leaf's cut at
     its end, a parent's opening text and child summaries shortened to
     fit). Model calls

@@ -32,7 +32,7 @@
 Este fork parte de [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex) `v0.6.0` y se publica con etiquetas `v<upstream>-tendios.<n>` (versión del paquete `<upstream>+tendios.<n>`); fija una etiqueta, nunca `main`:
 
 ```bash
-pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.6.0-tendios.1"
+pip install "pageindex[sql,s3] @ git+https://github.com/tendios/PageIndex@v0.6.0-tendios.2"
 ```
 
 ### Diferencias con upstream
@@ -52,7 +52,7 @@ Las extensiones de indexado se activan en modo local; el modo cloud conserva su 
 Instalación de la versión del fork con LiteParse:
 
 ```bash
-pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.6.0-tendios.1"
+pip install "pageindex[sql,s3,liteparse] @ git+https://github.com/tendios/PageIndex@v0.6.0-tendios.2"
 ```
 
 Para desarrollar desde este checkout:
@@ -109,7 +109,9 @@ títulos que detecta la maquetación de flash; descarta encabezados y pies repet
 y un juez decide las líneas que ninguna regla resuelve. Después siguen los resúmenes y la descripción de flash, sin
 optimizador: un apartado corto sigue siendo un apartado, porque así se pide el documento. Los resúmenes piensan lo
 mínimo que admite cada modelo, como en flash desde upstream 0.5.3; un `summary_reasoning_effort` elegido que el modelo
-no admite hace fallar el envío antes de leer los encabezados, sin gastar en Jev.
+no admite hace fallar el envío antes de leer los encabezados, sin gastar en Jev. Un modelo `openai/` que LiteLLM no
+conoce (el de un servidor compatible con OpenAI, como vLLM) recibe `"none"` y nada más: la llamada que lo rechaza va
+otra vez sin él y la siguiente vuelve a mandar `"none"` (en la Gemma de vLLM, `"low"` enciende el razonamiento).
 
 ```python
 client = PageIndexClient(index={"mode": "local", "model": "anthropic/claude-haiku-5-5",
