@@ -121,6 +121,57 @@ def test_all_native_or_all_ocr_needs_only_one_pass(tmp_path, monkeypatch, routed
     assert result.liteparse["ocr_pages"] == list(routed)
 
 
+HINT_FIELDS = ("tagged_headings", "inspector_headings")
+
+
+def without_hints(pages):
+    return [{key: value for key, value in p.items() if key not in HINT_FIELDS} for p in pages]
+
+
+def without_timings(read):
+    """A read's metadata or LiteParse result without what the clock gives: its seconds, each pass's, and
+    pdf-inspector's processing time."""
+    read = copy.deepcopy(read)
+    read.pop("seconds")
+    for p in read["passes"]:
+        p.pop("seconds")
+    (read.get("inspection") or {}).pop("processing_time_ms", None)
+    return read
+
+
+def test_without_heading_hints_their_two_reads_are_left_out_and_the_rest_is_the_same(tmp_path, monkeypatch):
+    path = tmp_path / "mixed.pdf"
+    path.write_bytes(b"fixture")
+    asked = []
+
+    def tagged(parser_class, data, count):
+        asked.append("tagged")
+        return [[{"level": 1, "text": f"Tagged {n}"}] for n in range(1, count + 1)]
+
+    def inspected(inspector, data, count):
+        asked.append("inspector")
+        return [[{"level": 2, "text": f"Inspected {n}"}] for n in range(1, count + 1)]
+
+    monkeypatch.setattr("pageindex.pdf_extraction._tagged_headings", tagged)
+    monkeypatch.setattr("pageindex.pdf_extraction._inspector_headings", inspected)
+    reads, calls = {}, {}
+    for hints in (True, False):
+        asked.clear()
+        calls[hints] = fake_parser(monkeypatch, [Result([page(1), page(2, ""), page(3)]),
+                                                 Result([page(2, "recovered")])])
+        reads[hints] = extract_liteparse(str(path), "liteparse", heading_hints=hints), list(asked)
+    (with_hints, asked_with), (without, asked_without) = reads[True], reads[False]
+    assert asked_with == ["tagged", "inspector"] and asked_without == []
+    # The indexing's read puts them on the native pages (page 2 went to OCR); without them no page has the fields.
+    assert [[key for key in HINT_FIELDS if key in p] for p in with_hints.pages] == [list(HINT_FIELDS), [],
+                                                                                    list(HINT_FIELDS)]
+    assert not any(key in p for p in without.pages for key in HINT_FIELDS)
+    assert json.dumps(without.pages) == json.dumps(without_hints(with_hints.pages))
+    assert calls[False] == calls[True] and len(calls[False]) == 2
+    assert without_timings(without.liteparse) == without_timings(with_hints.liteparse)
+    assert without_timings(without.metadata) == without_timings(with_hints.metadata)
+
+
 @pytest.mark.parametrize("bad", [Result([page(1)]), Result([page(2), page(2)]),
                                  Result([page(2)], total_pages=2), RuntimeError("OCR unavailable")])
 def test_failed_or_misnumbered_ocr_never_saves_partial_success(tmp_path, monkeypatch, bad):
@@ -336,6 +387,35 @@ def test_real_liteparse_reads_the_document_level_fields_for_the_caller(tmp_path)
     # The blocks the caller gets are the ones the index stores.
     assert [p["blocks"] for p in document["pages"]] == [p["layout"]["blocks"] for p in result.pages]
     json.dumps(result.liteparse, allow_nan=False)
+
+
+def test_real_liteparse_without_heading_hints_reads_once_and_gives_the_same_pages(tmp_path, monkeypatch):
+    liteparse = pytest.importorskip("liteparse")
+    pdf_inspector = pytest.importorskip("pdf_inspector")
+    from conftest import build_pdf
+    path = tmp_path / "titled.pdf"
+    path.write_bytes(build_pdf([
+        [(72, 720, 24, "1. Objeto del contrato"), (72, 690, 11, "El contrato tiene por objeto el suministro."),
+         (72, 670, 11, "Se entrega en el Almacen General cada mes.")],
+        [(72, 720, 24, "2. Precio"), (72, 690, 11, "El precio es de mil euros por cada lote.")]]))
+    with_hints = extract_liteparse(str(path), "liteparse")
+    assert any("inspector_headings" in p for p in with_hints.pages)  # pdf-inspector names a title here
+    built, markdown_reads = [], []
+
+    class Recorded(liteparse.LiteParse):
+        def __init__(self, **options):
+            built.append(options)
+            super().__init__(**options)
+
+    monkeypatch.setattr(liteparse, "LiteParse", Recorded)
+    monkeypatch.setattr(pdf_inspector, "extract_pages_markdown_bytes", markdown_reads.append)
+    without = extract_liteparse(str(path), "liteparse", heading_hints=False)
+    # One LiteParse read, the indexing's (no OCR here); no read with the text metadata, no pdf-inspector markdown.
+    assert len(built) == 1 and not any(options.get("extract_text_metadata") for options in built)
+    assert markdown_reads == []
+    assert json.dumps(without.pages) == json.dumps(without_hints(with_hints.pages))
+    assert json.dumps(without.liteparse["document"]) == json.dumps(with_hints.liteparse["document"])
+    assert without_timings(without.liteparse) == without_timings(with_hints.liteparse)
 
 
 def test_real_liteparse_ocr_of_image_only_pdf(tmp_path):

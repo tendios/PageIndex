@@ -212,7 +212,7 @@ def _tagged_headings(parser_class, data: bytes, count: int) -> list[list[dict]]:
     return [out.get(n, []) for n in range(1, count + 1)]
 
 
-def extract_liteparse(file_path: str, config: str | Mapping) -> PDFExtraction:
+def extract_liteparse(file_path: str, config: str | Mapping, *, heading_hints: bool = True) -> PDFExtraction:
     """Read the PDF with LiteParse, OCR only on the pages pdf-inspector selects, into the pages the index stores.
 
     The read also asks LiteParse for links, annotations, form fields, the structure tree, XFA packets, the document's
@@ -226,6 +226,12 @@ def extract_liteparse(file_path: str, config: str | Mapping) -> PDFExtraction:
     - inspection: pdf-inspector's answer (version, pdf_type, confidence, page_count, pages_needing_ocr,
       ocr_reasons_by_page, has_encoding_issues, processing_time_ms), None unless ocr_mode is auto;
     - passes (ocr_enabled, target_pages, seconds) and seconds, the whole read up to the merged result.
+
+    heading_hints: the two more reads of the PDF the `headings` mode takes hints from, kept on the native pages as
+    `tagged_headings` (the headings a tagged PDF declares) and `inspector_headings` (those of pdf-inspector's own
+    markdown). The indexing needs them (True, the default). False leaves both reads out, which on a long PDF take
+    most of the time, and no page has those two fields; everything else (the pages, their blocks, `liteparse`) is
+    the same.
     """
     conf = parser_config(config)
     try:
@@ -297,12 +303,13 @@ def extract_liteparse(file_path: str, config: str | Mapping) -> PDFExtraction:
         document["text"] = "\n\n".join(str(page.get("text") or "") for page in document["pages"])
     read_seconds = perf_counter() - started
     pages = [_page_record(by_page[n], conf, n in routed) for n in range(1, count + 1)]
-    for record, heads in zip(pages, _tagged_headings(LiteParse, data, count)):
-        if heads and record["page_index"] not in routed:
-            record["tagged_headings"] = heads
-    for record, heads in zip(pages, _inspector_headings(pdf_inspector, data, count)):
-        if heads and record["page_index"] not in routed:
-            record["inspector_headings"] = heads
+    if heading_hints:
+        for record, heads in zip(pages, _tagged_headings(LiteParse, data, count)):
+            if heads and record["page_index"] not in routed:
+                record["tagged_headings"] = heads
+        for record, heads in zip(pages, _inspector_headings(pdf_inspector, data, count)):
+            if heads and record["page_index"] not in routed:
+                record["inspector_headings"] = heads
     metadata = {"parser": "liteparse", "version": version("liteparse"),
                 "ocr_mode": mode, "ocr_language": conf["ocr_language"],
                 "ocr_backend": "http" if conf.get("ocr_server_url") else "tesseract",
