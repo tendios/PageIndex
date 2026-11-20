@@ -97,10 +97,9 @@ def _swallowing_table(block: dict, width: float, height: float) -> bool:
 _CALLER_ONLY_FIELDS = ("annotations", "form_fields", "structure_tree", "complexity")
 
 
-def _page_record(page: dict, conf: dict, routed: bool) -> dict:
-    number, width, height = page["page_num"], page["width"], page["height"]
-    if width <= 0 or height <= 0:
-        raise ValueError(f"LiteParse returned invalid dimensions on page {number}")
+def _text_format(page: dict, conf: dict) -> str:
+    """How the fork renders a page: "blocks" (LiteParse's blocks) or "spatial" (its spatial text, fenced)."""
+    width, height = page["width"], page["height"]
     raw_blocks = page.get("blocks") or []
     spatial = page.get("text") or ""
     # If no table was recognized, keep the parser's column spacing instead
@@ -115,17 +114,37 @@ def _page_record(page: dict, conf: dict, routed: bool) -> dict:
     # margin makes the reader see two columns): its blocks interleave the text, the spatial text does not.
     use_spatial = use_spatial or (conf["text_format"] == "auto" and any(_swallowing_table(b, width, height)
                                                                          for b in raw_blocks))
+    if use_spatial or not any(_block_text(block).strip() for block in raw_blocks):
+        return "spatial"
+    return "blocks"
+
+
+def _page_record(page: dict, conf: dict, routed: bool, text_format: str | None = None,
+                 text_check: dict | None = None) -> dict:
+    """The page the index stores. `text_format` imposes the rendering (a recovered page keeps the one of the read it
+    was recovered from); `text_check` is what the text check did on the page (pageindex.text_check)."""
+    number, width, height = page["page_num"], page["width"], page["height"]
+    if width <= 0 or height <= 0:
+        raise ValueError(f"LiteParse returned invalid dimensions on page {number}")
+    raw_blocks = page.get("blocks") or []
+    spatial = page.get("text") or ""
+    use_spatial = (text_format or _text_format(page, conf)) == "spatial"
     rendered = [(block, _block_text(block)) for block in raw_blocks]
     rendered = [(block, text) for block, text in rendered if text.strip()]
     if use_spatial or not rendered:
         use_spatial = True
         text = spatial.strip("\n")
+        spans = (page.get("recovered") or {}).get("text") or []
         if use_spatial and text.strip():
             # Choose a fence that cannot be closed by source content.
             fence = "`" * max(3, 1 + max((len(m[0]) for m in re.finditer(r"`+", text)), default=0))
+            shift = len(fence) + len("text\n") - (len(spatial) - len(spatial.lstrip("\n")))
+            spans = [[s + shift, e + shift, was] for s, e, was in spans]
             text = f"{fence}text\n{text}\n{fence}"
-        rendered = [({"kind": "page", "bbox": {"x": 0, "y": 0,
-                                                "width": width, "height": height}}, text)] if text.strip() else []
+        page_block = {"kind": "page", "bbox": {"x": 0, "y": 0, "width": width, "height": height}}
+        if spans:
+            page_block["recovered"] = spans
+        rendered = [(page_block, text)] if text.strip() else []
     blocks = []
     for i, (block, text) in enumerate(rendered, 1):
         entry = {"block_id": f"p{number}_text_{i}", "page": number,
@@ -133,6 +152,10 @@ def _page_record(page: dict, conf: dict, routed: bool) -> dict:
         if block.get("bbox"):
             entry["bbox"] = _bbox(block["bbox"], width, height)
             entry["bbox_points"] = block["bbox"]
+        if block.get("recovered"):
+            # the recovered spans of the block's text, after the heading's «#» or the list item's marker
+            shift = 0 if block["kind"] == "page" else len(text) - len(block.get("text") or "")
+            entry["recovered"] = [[s + shift, e + shift, was] for s, e, was in block["recovered"]]
         blocks.append(entry)
     return {"page_index": number,
             "markdown": "\n\n".join(block["text"] for block in blocks),
@@ -142,7 +165,8 @@ def _page_record(page: dict, conf: dict, routed: bool) -> dict:
             "extraction": {"parser": "liteparse", "ocr_routed": routed,
                            "ocr_text_present": any(t.get("confidence") is not None
                                                    for t in page.get("text_items", [])),
-                           "text_format": "spatial" if use_spatial else "blocks"},
+                           "text_format": "spatial" if use_spatial else "blocks",
+                           **({"text_check": text_check} if text_check else {})},
             "layout": {"coordinate_system": {"origin": "top-left", "units": "pt",
                                                "dpi": 72, "space": "displayed_page"},
                        **{key: None if key in _CALLER_ONLY_FIELDS else value for key, value in page.items()}}}
@@ -255,20 +279,23 @@ def extract_liteparse(file_path: str, config: str | Mapping, *, heading_hints: b
                      "processing_time_ms": detected.processing_time_ms}
     passes = []
 
+    def options(ocr: bool, targets: list[int] | None) -> dict:
+        return dict(ocr_enabled=ocr, ocr_language=conf["ocr_language"],
+                    ocr_server_url=conf.get("ocr_server_url"),
+                    target_pages=",".join(map(str, targets)) if targets else None,
+                    output_format="markdown", keep_headers_footers=True,
+                    extract_blocks=True, emit_word_boxes=True,
+                    extract_images=False, extract_screenshots=False,
+                    extract_content_bounds=True, preserve_very_small_text=True,
+                    # For the caller's copy of the result only: they leave the text and the blocks as
+                    # they are. Not extract_text_metadata: it splits the text items and changes the blocks.
+                    extract_links=True, extract_annotations=True, extract_form_fields=True,
+                    extract_structure_tree=True, extract_xfa_packets=True,
+                    extract_document_metadata=True, include_complexity=True,
+                    continue_on_page_error=False, ocr_failure_fatal=True, quiet=True)
+
     def parse(ocr: bool, targets: list[int] | None = None) -> dict:
-        parser = LiteParse(ocr_enabled=ocr, ocr_language=conf["ocr_language"],
-                           ocr_server_url=conf.get("ocr_server_url"),
-                           target_pages=",".join(map(str, targets)) if targets else None,
-                           output_format="markdown", keep_headers_footers=True,
-                           extract_blocks=True, emit_word_boxes=True,
-                           extract_images=False, extract_screenshots=False,
-                           extract_content_bounds=True, preserve_very_small_text=True,
-                           # For the caller's copy of the result only: they leave the text and the blocks as
-                           # they are. Not extract_text_metadata: it splits the text items and changes the blocks.
-                           extract_links=True, extract_annotations=True, extract_form_fields=True,
-                           extract_structure_tree=True, extract_xfa_packets=True,
-                           extract_document_metadata=True, include_complexity=True,
-                           continue_on_page_error=False, ocr_failure_fatal=True, quiet=True)
+        parser = LiteParse(**options(ocr, targets))
         tick = perf_counter()
         result = asdict(parser.parse(data))
         if result.get("page_errors"):
@@ -276,6 +303,18 @@ def extract_liteparse(file_path: str, config: str | Mapping, *, heading_hints: b
         passes.append({"ocr_enabled": ocr, "target_pages": targets,
                        "seconds": perf_counter() - tick})
         return result
+
+    # The text check's own reads of one page (pageindex.text_check): with the clipped text kept (to tell hidden
+    # text from lost text), with the text metadata, or with OCR and the text metadata.
+    rereads = {"clipped": {"keep_clipped_text": True}, "text_metadata": {"extract_text_metadata": True},
+               "ocr": {"extract_text_metadata": True}}
+
+    def reread(number: int, how: str) -> dict:
+        result = asdict(LiteParse(**options(how == "ocr", [number]), **rereads[how]).parse(data))
+        found = [page for page in result.get("pages") or [] if page.get("page_num") == number]
+        if result.get("page_errors") or len(found) != 1:
+            raise ValueError(f"LiteParse could not read page {number} again: {result.get('page_errors')}")
+        return found[0]
 
     all_ocr = mode == "enabled" or (inspection is not None and len(routed) == inspection["page_count"])
     result = parse(all_ocr)
@@ -301,8 +340,25 @@ def extract_liteparse(file_path: str, config: str | Mapping, *, heading_hints: b
         document = {**result, "pages": [by_page[n] for n in range(1, count + 1)],
                     "page_errors": [*result.get("page_errors", []), *targeted.get("page_errors", [])]}
         document["text"] = "\n\n".join(str(page.get("text") or "") for page in document["pages"])
+    # Every native page checked against PDFium's text layer, and what LiteParse lost put back (text_check).
+    from .text_check import check_pages, document_text
+    read = dict(by_page)
+    text_check, changed = check_pages(data, by_page, [n for n in range(1, count + 1) if n not in routed], reread,
+                                      ocr=mode != "disabled", text_format=lambda page: _text_format(page, conf),
+                                      swallowing=_swallowing_table)
+    if changed:
+        document = {**document, "pages": [by_page[n] for n in range(1, count + 1)]}
+        document["text"] = document_text(str(document.get("text") or ""), [read[n] for n in range(1, count + 1)],
+                                         document["pages"])
+    done = {e["page"]: e for e in text_check["pages"] if e.get("action") not in (None, "none")}
     read_seconds = perf_counter() - started
-    pages = [_page_record(by_page[n], conf, n in routed) for n in range(1, count + 1)]
+    pages = [_page_record(by_page[n], conf, n in routed,
+                          # a recovered page keeps the rendering of the read it was recovered from
+                          text_format=_text_format(read[n], conf) if done.get(n, {}).get("action") == "recovered"
+                          else None,
+                          text_check={key: done[n][key] for key in ("action", "read")} | {
+                              "lines": done[n]["lost"]["lines"]} if n in done else None)
+             for n in range(1, count + 1)]
     if heading_hints:
         for record, heads in zip(pages, _tagged_headings(LiteParse, data, count)):
             if heads and record["page_index"] not in routed:
@@ -315,7 +371,7 @@ def extract_liteparse(file_path: str, config: str | Mapping, *, heading_hints: b
                 "ocr_backend": "http" if conf.get("ocr_server_url") else "tesseract",
                 "ocr_pages": routed, "inspection": inspection,
                 "ocr_empty_pages": [n for n in routed if not (by_page[n].get("text") or "").strip()],
-                "passes": passes, "seconds": perf_counter() - started}
+                "passes": passes, "text_check": text_check, "seconds": perf_counter() - started}
     liteparse = {key: metadata[key] for key in ("version", "ocr_mode", "ocr_language", "ocr_backend", "ocr_pages")}
     liteparse.update(inspection=detection, passes=[dict(p) for p in passes], seconds=read_seconds, document=document)
     return PDFExtraction(pages, metadata, liteparse=liteparse)

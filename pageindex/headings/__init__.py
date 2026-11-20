@@ -41,7 +41,14 @@ def build_headings_structure(pages: list[dict[str, Any]], page_texts: list[str],
     """The structure and a report of how it was built: candidates, how many the numbering spine settled, how many
     the judge decided, how many fell to the rules, and the headings kept."""
     from ..flash.api import _add_intros, _add_preface, _page_lines
+    from ..text_check import as_read
     from .structure import build, collect, decide_unsettled, ranks
+    # The headings come from the read as LiteParse gave it: the lines the text check put back (pageindex.text_check)
+    # are never candidates and never move one, nor the page ranges around them.
+    read = [as_read(page) for page in pages]
+    page_texts = [read[k]["markdown"] if k < len(read) and read[k] is not pages[k] else text
+                  for k, text in enumerate(page_texts)]
+    pages = read
     candidates, report, body = collect(pages, layout_structure)
     ask = [c for c in candidates if c.decision is None]
     judged: dict[int, tuple[str, float]] = {}

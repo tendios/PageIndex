@@ -3,14 +3,15 @@ rendered from the PDF with PDFium and sized within TypeSafe's limits (each side 
 from __future__ import annotations
 
 import re
-import threading
 import unicodedata
 from io import BytesIO
 from typing import Any, Optional
 
+from ..text_check import PDFIUM_LOCK
+
 MIN_SIDE, MAX_SIDE = 280, 1568
 SCALE = 2.0                      # 144 dpi
-_lock = threading.Lock()
+_lock = PDFIUM_LOCK             # PDFium is not thread-safe: the fork's one lock for it
 _docs: dict[str, Any] = {}
 
 
